@@ -195,8 +195,13 @@ class HFModelConfig(BaseConfig):
 
         self.share_embeddings_and_output_weights = getattr(self.hf_config, "tie_word_embeddings", False)
 
-        # get model architectures
-        self.architectures = getattr(self.hf_config, "architectures", None)
+        # get model architectures (prefer hf_config; fallback to YAML override)
+        # PATCH 2026-05-24 qwen25_vla_grpo: transformers 4.57.6 Qwen2_5_VLConfig.from_pretrained
+        # strips top-level architectures when loading a 5.x-saved config.json. Honor manual
+        # `architectures: [...]` from YAML when hf_config lacks it.
+        hf_arch = getattr(self.hf_config, "architectures", None)
+        if hf_arch:
+            self.architectures = hf_arch
         assert self.architectures is not None and len(self.architectures) == 1, (
             "Expect only one architecture, got {}".format(self.architectures)
         )
