@@ -107,7 +107,9 @@ class TorchTitanEngine(BaseEngine):
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
 
         # Get ModelSpec from model registry
-        model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
+        from .utils import _import_torchtitan_model_module
+
+        model_module = _import_torchtitan_model_module(torchtitan_name)
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
 
         optimizer = OptimizersContainer.Config(
