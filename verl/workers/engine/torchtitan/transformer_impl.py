@@ -152,6 +152,11 @@ class TorchTitanEngine(BaseEngine):
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
+            # verl's trainer.save_freq is the cadence authority and save() is
+            # only called on those steps; defer torchtitan's own interval to 1
+            # so every requested save writes (default 500 silently drops all
+            # saves in runs shorter than 500 / not multiples of it).
+            interval=1,
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
