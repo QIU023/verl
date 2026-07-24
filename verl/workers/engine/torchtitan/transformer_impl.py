@@ -105,6 +105,9 @@ class TorchTitanEngine(BaseEngine):
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
+        # kimi_k3 handles CP module-internally (Ulysses) and is causal-only:
+        # no attention_masks consumed, no upstream CP mask sharding needed.
+        self._model_cp_is_module_internal = torchtitan_name == "kimi_k3"
 
         # Get ModelSpec from model registry
         from .utils import _import_torchtitan_model_module
@@ -146,6 +149,16 @@ class TorchTitanEngine(BaseEngine):
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             spmd_backend=self.engine_config.spmd_backend,
+            # kimi_k3's module-internal CP reassembles contiguous
+            # rank-ordered seq shards; the upstream default 'headtail'
+            # balancer PERMUTES the sequence before sharding, silently
+            # breaking causal order (future-token leakage) -- its
+            # parallelize raises on any balancer. Upstream-CP models
+            # (llama3/qwen3/...) keep the torchtitan default.
+            context_parallel_load_balancer=(
+                None if torchtitan_name == "kimi_k3"
+                else ParallelismConfig.context_parallel_load_balancer
+            ),
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -333,12 +346,26 @@ class TorchTitanEngine(BaseEngine):
         raise NotImplementedError
 
     def _get_data_parallel_mesh(self):
-        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
-        mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
-        if mesh is None:
-            mesh = self.parallel_dims.get_optional_mesh("fsdp")
-        if mesh is None:
-            mesh = self.parallel_dims.get_optional_mesh("dp_replicate")
+        """Get the DATA-loading parallel mesh (excludes cp).
+
+        torchtitan's "fsdp" mesh is dp_shard x cp -- FSDP folds cp into its
+        gradient-reduction axis -- so under cp > 1 it is NOT the dataloader
+        axis: all cp ranks of one dp group must receive the SAME batch (the
+        trainer seq-shards it across cp afterwards). "batch" is
+        dp_replicate x dp_shard, exactly the sampler axis; using "fsdp"
+        here made rank cp_i draw sample shard i and crash the
+        DistributedSampler (rank >= num_replicas) at dp_shard=1, cp=2.
+        """
+        mesh = self.parallel_dims.get_optional_mesh("batch")
+        if mesh is None and self.parallel_dims.cp == 1:
+            # Legacy fallbacks; only valid when cp == 1 (then fsdp ==
+            # dp_shard). Under cp > 1 with no real dp, the correct answer
+            # is None (single dp replica, rank 0).
+            mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
+            if mesh is None:
+                mesh = self.parallel_dims.get_optional_mesh("fsdp")
+            if mesh is None:
+                mesh = self.parallel_dims.get_optional_mesh("dp_replicate")
         return mesh
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
@@ -399,6 +426,16 @@ class TorchTitanEngine(BaseEngine):
 
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
+        if parallel_dims.cp_enabled:
+            # Inputs were seq-sharded across cp; the loss side works on
+            # full sequences (see prepare_model_inputs), so gather the
+            # logits back (differentiable -> reduce-scatter backward).
+            import torch.distributed.nn.functional as dist_nn
+
+            cp_group = parallel_dims.get_mesh("cp").get_group()
+            pred = torch.cat(
+                dist_nn.all_gather(pred.contiguous(), group=cp_group), dim=1
+            )
         return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -664,7 +701,27 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
         if self.parallel_dims.cp_enabled:
-            input_ids, labels, extra_kwargs = prepare_context_parallel_input(
+            # prepare_context_parallel_input contract: positions must ride
+            # in extra_kwargs (it seq-shards them alongside inputs/labels);
+            # this engine keeps positions in extra_inputs, so bridge them
+            # across the call. Was a latent KeyError -- this CP path had
+            # never been exercised before the kimi_k3 CP work.
+            extra_kwargs["positions"] = extra_inputs["positions"]
+            # Module-internal-CP models (kimi_k3) are causal-only and never
+            # consume attention_masks; upstream's BlockMask CP sharding also
+            # requires seq_len % (cp * 128) == 0, which SFT batches don't
+            # guarantee. Keep the mask out of the CP shard for them.
+            masks = (
+                extra_kwargs.pop("attention_masks", None)
+                if self._model_cp_is_module_internal
+                else None
+            )
+            # Keep labels FULL length: verl's loss path (nested no-padding
+            # log_prob/loss_mask handling) assumes full sequences, so the
+            # engine all-gathers the seq-sharded logits after the model
+            # call (model_forward_step) instead of sharding the loss side.
+            labels_full = labels
+            input_ids, _labels_sharded, extra_kwargs = prepare_context_parallel_input(
                 input_ids,
                 labels,
                 extra_kwargs,
@@ -672,6 +729,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 self.trainer.device,
                 self.trainer.config.parallelism.context_parallel_load_balancer,
             )
+            labels = labels_full
+            extra_inputs["positions"] = extra_kwargs.pop("positions")
+            if masks is not None:
+                extra_kwargs["attention_masks"] = masks
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
