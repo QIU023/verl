@@ -77,6 +77,11 @@ _HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
     # Kimi-Linear / K3 family lives under torchtitan.experiments until
     # core promotion; _import_torchtitan_model_module falls back there.
     "kimi_linear": "kimi_k3",
+    # K3's released config.json declares model_type "kimi_k3" (the 48B
+    # predecessor used "kimi_linear"), and both resolve to the same torchtitan
+    # package -- the flavor is then picked by shape, so one package serves the
+    # 48B, the scaling-law sizes and the 2.8T alike.
+    "kimi_k3": "kimi_k3",
 }
 
 
