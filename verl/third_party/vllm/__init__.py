@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging import version as vs
@@ -29,6 +30,13 @@ def get_version(pkg):
 
 package_name = "vllm"
 package_version = get_version(package_name)
+# A vLLM built from a source checkout with no release tag reports a
+# setuptools-scm placeholder ("0.1.dev1+g<sha>"), which the >= 0.7.0 gate below
+# rejects even though the tree is newer than every release. Needed to run a
+# model that only exists on a vLLM branch.
+_version_override = os.environ.get("VERL_VLLM_VERSION")
+if _version_override:
+    package_version = _version_override
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
 
