@@ -27,7 +27,25 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import (
+                index_first_axis,
+                pad_input,
+                rearrange,
+                unpad_input,
+            )
+        except ImportError:
+            # These four are index/gather utilities, not attention kernels, so
+            # requiring a flash-attn build to reach them blocks any environment
+            # that cannot install it -- e.g. a torch build with no matching
+            # prebuilt wheel. transformers ships equivalent pure-torch
+            # implementations, which is already the documented NPU route.
+            from einops import rearrange
+            from transformers.modeling_flash_attention_utils import (
+                _index_first_axis as index_first_axis,
+                _pad_input as pad_input,
+                _unpad_input as unpad_input,
+            )
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 

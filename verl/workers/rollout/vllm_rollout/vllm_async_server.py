@@ -62,7 +62,16 @@ from verl.workers.rollout.vllm_rollout.utils import (
     get_vllm_max_lora_rank,
 )
 
-_VLLM_VERSION = version.parse(vllm.__version__)
+# A vLLM built from a source checkout with no release tag reports the
+# setuptools-scm placeholder "0.1.dev1+g<sha>", which makes every version gate
+# below take its oldest branch -- here that means importing
+# FlexibleArgumentParser from vllm.utils, where it no longer lives once
+# vllm.utils becomes a package. VERL_VLLM_VERSION states the effective version,
+# the same override verl/third_party/vllm/__init__.py already honours.
+# NOTE: verl/utils/distributed.py, verl/utils/vllm/npu_vllm_patch.py and
+# verl/utils/vllm/vllm_fp8_utils.py parse vllm.__version__ the same way and have
+# the same blind spot; factoring this into one resolver is a follow-up.
+_VLLM_VERSION = version.parse(os.environ.get("VERL_VLLM_VERSION") or vllm.__version__)
 _RESET_PREFIX_CACHE_KWARGS = {}
 if _VLLM_VERSION >= version.parse("0.13.0"):
     _RESET_PREFIX_CACHE_KWARGS["reset_connector"] = True
