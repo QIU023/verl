@@ -113,7 +113,21 @@ class TorchTitanEngine(BaseEngine):
         from .utils import _import_torchtitan_model_module
 
         model_module = _import_torchtitan_model_module(torchtitan_name)
-        model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
+        # Two naming spaces in the kimi_k3 package: model_registry parses
+        # "<size>_<variant>", while the debug, report-architecture and QAT
+        # flavors are config_registry FUNCTIONS whose names it cannot parse.
+        # Without the fallback, VERL_TORCHTITAN_FLAVOR can only reach the first
+        # kind, which silently excludes every flavor defined the second way.
+        try:
+            model_spec = model_module.model_registry(
+                torchtitan_flavor, attn_backend=self.engine_config.attn_type
+            )
+        except ValueError:
+            config_registry = getattr(model_module, "config_registry", None)
+            fn = getattr(config_registry, torchtitan_flavor, None) if config_registry else None
+            if fn is None or not callable(fn):
+                raise
+            model_spec = fn().model_spec
 
         optimizer = OptimizersContainer.Config(
             param_groups=[
