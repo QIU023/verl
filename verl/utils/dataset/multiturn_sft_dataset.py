@@ -70,6 +70,29 @@ def print_assembled_message(tokenizer, message_list, input_ids, loss_mask, attn_
     logger.debug(str)
 
 
+def _processor_patch_size(processor):
+    """Patch size from a processor, tolerant of where it keeps it.
+
+    Most processors expose ``image_processor.patch_size`` directly. Kimi K3's
+    KimiK3VisionProcessor keeps its settings nested under ``media_proc_cfg``, so a
+    direct attribute read raises AttributeError and takes down dataset
+    construction -- before the config override that exists for exactly this case
+    can be consulted, because a default argument is evaluated eagerly.
+    """
+    if processor is None:
+        return None
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return None
+    size = getattr(image_processor, "patch_size", None)
+    if size is not None:
+        return size
+    cfg = getattr(image_processor, "media_proc_cfg", None)
+    if isinstance(cfg, dict):
+        return cfg.get("patch_size")
+    return getattr(cfg, "patch_size", None)
+
+
 class MultiTurnSFTDataset(Dataset):
     """
     Dataset for multi-turn conversations where each assistant response should be trained
@@ -104,7 +127,7 @@ class MultiTurnSFTDataset(Dataset):
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get(
-            "image_patch_size", processor.image_processor.patch_size if processor else None
+            "image_patch_size", _processor_patch_size(processor)
         )
         self.tools_key = config.get("tools_key", "tools")
         self.enable_thinking_key = config.get("enable_thinking_key", "enable_thinking")
