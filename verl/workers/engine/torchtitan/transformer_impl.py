@@ -573,6 +573,55 @@ class TorchTitanEngine(BaseEngine):
             module_params = module.state_dict()
             params.update(module_params)
 
+        # DIAGNOSTIC, off unless KIMI_GRPO_FREEZE_SYNC=1. Ships the FIRST step's
+        # weights forever, so the rollout engine runs a stale policy while the actor
+        # keeps training.
+        #
+        # It exists to make rollout_probs_diff interpretable. With a zero-variance
+        # reward the actor never moves, so a working sync and a no-op sync give
+        # identical probs_diff and the metric proves nothing -- measured:
+        # grad_norm was exactly 0.0. With a variance reward the actor does move and
+        # probs_diff grows 1.75e-03 -> 2.45e-03 over three steps, but that alone
+        # does not show the metric is SENSITIVE to the sync. Freezing the sync is
+        # the differential: if probs_diff does not grow well past the synced
+        # baseline, then no value of it says anything about the sync.
+        import os as _os
+
+        if _os.environ.get("KIMI_GRPO_FREEZE_SYNC") == "1":
+            if not hasattr(self, "_frozen_sync_params"):
+                self._frozen_sync_params = {
+                    k: v.detach().clone() for k, v in params.items()
+                }
+                logger.warning(
+                    "KIMI_GRPO_FREEZE_SYNC=1: caching %d tensors and shipping them "
+                    "to the rollout engine for every later step. DIAGNOSTIC ONLY -- "
+                    "the rollout policy is deliberately stale.",
+                    len(params),
+                )
+            params = dict(self._frozen_sync_params)
+
+        # Direct check instead of inferring from rollout_probs_diff. A checksum of
+        # one real parameter, logged every sync: it must CHANGE across steps when the
+        # sync is live and stay CONSTANT when frozen. Inferring from probs_diff
+        # failed because the two arms sample different responses, so the metric is
+        # not comparing the same tokens -- an uncontrolled comparison, not evidence.
+        if _os.environ.get("KIMI_GRPO_SYNC_CHECKSUM", "1") == "1":
+            import hashlib as _hl
+
+            probe = None
+            for k in sorted(params):
+                v = params[k]
+                if hasattr(v, "numel") and v.numel() > 1 and v.dtype.is_floating_point:
+                    probe = (k, v)
+                    break
+            if probe is not None:
+                k, v = probe
+                t = v.to_local() if hasattr(v, "to_local") else v
+                digest = _hl.sha256(
+                    t.detach().float().cpu().contiguous().numpy().tobytes()
+                ).hexdigest()[:16]
+                logger.warning("SYNC-CHECKSUM %s %s", digest, k)
+
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
