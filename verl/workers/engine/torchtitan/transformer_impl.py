@@ -570,7 +570,7 @@ class TorchTitanEngine(BaseEngine):
 
         params = {}
         for module in self.module:
-            module_params = module.state_dict()
+            module_params = _merged_state_dict_if_lora(module)
             params.update(module_params)
 
         # DIAGNOSTIC, off unless KIMI_GRPO_FREEZE_SYNC=1. Ships the FIRST step's
@@ -662,6 +662,44 @@ class TorchTitanEngine(BaseEngine):
             )
         # TODO: support Torchtitan PEFT
         return per_tensor_param, None
+
+
+def _merged_state_dict_if_lora(module):
+    """``module.state_dict()``, with LoRA adapters folded into the base weights.
+
+    A LoRA-wrapped projection stores ``base.weight``, ``lora_a`` and ``lora_b``. The
+    state-dict adapter maps ``base.weight`` to the plain HF name and has no mapping
+    for the adapter tensors, so a raw state_dict ships the UNMERGED base and silently
+    drops everything LoRA learned. Under LoRA the base is frozen, so the rollout
+    engine would then receive the same weights at every step -- indistinguishable
+    from a broken sync, and the actor would train adapters the rollout never sees.
+
+    Measured on kimi_k3_debugmodel_gated_lora: with lora_b at its zero init the two
+    paths agree (LoRA is identity at step 0, so that is correct); with lora_b set to
+    0.01 the merged path changes and the raw path does not. Key sets are identical
+    either way, 151 both, so this is a drop-in for the sync.
+
+    Non-LoRA models take the plain path -- the import and the scan are both skipped
+    unless a wrapper is actually present.
+    """
+    has_lora = any(
+        hasattr(m, "lora_a") and hasattr(m, "lora_b") and hasattr(m, "base")
+        for m in module.modules()
+    )
+    if not has_lora:
+        return module.state_dict()
+    from torchtitan.models.kimi_k3.lora import merge_lora_state_dict
+
+    # Merged, not adapter-mode, and that is forced rather than chosen: this engine
+    # returns peft_config=None, so engine_workers never takes its adapter path
+    # (do_lora_base_sync is gated on peft_config being present). A run configured
+    # with model.lora.merge=False still gets merged weights here.
+    logger.info(
+        "weight sync: folding LoRA adapters into base weights before to_hf; "
+        "shipping the raw state dict would send the frozen base only. This engine "
+        "has no adapter-mode sync (peft_config is None), so merged is the only mode."
+    )
+    return merge_lora_state_dict(module)
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
