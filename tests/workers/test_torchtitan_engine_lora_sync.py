@@ -47,7 +47,11 @@ def _helper():
     ).read_text()
     start = src.index("def _merged_state_dict_if_lora")
     end = src.index("class EngineEvalModeCtx")
-    ns = {"logger": types.SimpleNamespace(info=lambda *a, **k: None)}
+    ns = {
+        "logger": types.SimpleNamespace(
+            info=lambda *a, **k: None, warning=lambda *a, **k: None
+        )
+    }
     exec(compile(src[start:end], "transformer_impl_excerpt", "exec"), ns)
     return ns["_merged_state_dict_if_lora"]
 
@@ -62,8 +66,9 @@ def _lora_model():
 
 class TestMergedWeightSync:
     def test_adapter_tensors_do_not_reach_the_rollout(self):
-        merged = _helper()(_lora_model())
+        merged, merged_keys = _helper()(_lora_model())
         assert not [k for k in merged if "lora" in k or ".base." in k]
+        assert merged_keys, "the merge must report which keys it produced"
         assert "layers.0.ffn.gate_proj.weight" in merged
 
     def test_the_merged_output_tracks_the_adapter(self):
@@ -76,7 +81,7 @@ class TestMergedWeightSync:
         model = _lora_model()
         helper = _helper()
         key = "layers.0.ffn.gate_proj.weight"
-        before = helper(model)[key].clone()
+        before = helper(model)[0][key].clone()
         raw_before = model.state_dict()["layers.0.ffn.gate_proj.base.weight"].clone()
 
         with torch.no_grad():
@@ -84,7 +89,7 @@ class TestMergedWeightSync:
                 if name.endswith("lora_b"):
                     param.fill_(0.01)
 
-        assert not torch.equal(helper(model)[key], before)
+        assert not torch.equal(helper(model)[0][key], before)
         raw_after = model.state_dict()["layers.0.ffn.gate_proj.base.weight"]
         assert torch.equal(raw_after, raw_before)
 
@@ -92,4 +97,6 @@ class TestMergedWeightSync:
         from torchtitan.models.kimi_k3 import config_registry as cr
 
         model = cr.kimi_k3_debugmodel_report_arch().model_spec.model.build()
-        assert set(_helper()(model)) == set(model.state_dict())
+        plain, merged_keys = _helper()(model)
+        assert set(plain) == set(model.state_dict())
+        assert merged_keys == frozenset()
