@@ -564,16 +564,50 @@ class TorchTitanEngine(BaseEngine):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.optimizer)
 
-    def get_per_tensor_param(self, **kwargs):
+    def get_per_tensor_param(self, base_sync_done: bool = False, **kwargs):
         for module in self.module:
             load_fsdp_model_to_gpu(module)
 
+        # Adapter-mode sync, the answer to the old "support Torchtitan PEFT" TODO.
+        # engine_workers gates its base-then-adapter sequence on peft_config being
+        # present, so returning None forced every LoRA run through a merged full-weight
+        # sync even when it asked for model.lora.merge=False -- LoRA then bought
+        # optimizer and gradient memory but none of its sync bandwidth.
+        wrappers = {}
+        for module in self.module:
+            wrappers.update(_titan_lora_wrappers(module))
+        # Adapter mode is OPT-IN. model_config.lora defaults to an EMPTY dict, so
+        # reading merge off it with a False default would flip every existing LoRA run
+        # onto this path -- and the merged path is the one with end-to-end evidence.
+        # An empty (or absent) lora block means the run said nothing about PEFT, so it
+        # stays merged; a configured block honours its own merge flag, defaulting to
+        # False the way the megatron engine does.
+        lora_cfg = getattr(self.model_config, "lora", None)
+        if not isinstance(lora_cfg, dict):
+            lora_cfg = {} if lora_cfg is None else dict(vars(lora_cfg))
+        peft_merge = bool(lora_cfg.get("merge", False)) if lora_cfg else True
+        adapter_mode = bool(wrappers) and not peft_merge
+        peft_config = _peft_config_from_wrappers(wrappers) if adapter_mode else None
+
         params = {}
         merged_lora_keys: set[str] = set()
-        for module in self.module:
-            module_params, module_merged = _merged_state_dict_if_lora(module)
-            params.update(module_params)
-            merged_lora_keys.update(module_merged)
+        if adapter_mode:
+            # Unmerged: to_hf renames <fqn>.base.weight to <fqn>.weight and drops the
+            # adapter tensors, which is exactly the base half of the sequence.
+            for module in self.module:
+                params.update(module.state_dict())
+            # Point the checksum probe at the adapters: they are the only tensors that
+            # move under LoRA, and the base half is frozen by construction. lora_b
+            # starts at zero, so lora_a is listed first -- a zero digest on step 1 is
+            # correct but reads like a broken probe.
+            merged_lora_keys = {
+                k for k in params if k.endswith(("lora_a", "lora_b"))
+            }
+        else:
+            for module in self.module:
+                module_params, module_merged = _merged_state_dict_if_lora(module)
+                params.update(module_params)
+                merged_lora_keys.update(module_merged)
 
         # DIAGNOSTIC, off unless KIMI_GRPO_FREEZE_SYNC=1. Ships the FIRST step's
         # weights forever, so the rollout engine runs a stale policy while the actor
@@ -640,8 +674,31 @@ class TorchTitanEngine(BaseEngine):
 
         # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
+        hf_names = {}
         if sd_adapter is not None:
+            if adapter_mode:
+                hf_names = _wrapped_hf_base_names(sd_adapter, wrappers, params)
             params = sd_adapter.to_hf(params)
+        elif adapter_mode:
+            raise ValueError(
+                "adapter-only weight sync needs the state-dict adapter to name the "
+                "wrapped projections; none is configured"
+            )
+
+        if adapter_mode:
+            if base_sync_done:
+                # Second half of the sequence: only what LoRA learned goes over.
+                params = _adapter_state_dict(wrappers, hf_names)
+            else:
+                params = _insert_base_layer_suffix(params, hf_names)
+            logger.warning(
+                "weight sync: adapter mode, base_sync_done=%s, shipping %d tensors "
+                "(rank %d, %d wrapped projections)",
+                base_sync_done,
+                len(params),
+                peft_config["r"],
+                len(wrappers),
+            )
 
         # When weight tying is enabled, the sd_adapter skips lm_head.weight during
         # to_hf() conversion (since it's the same tensor as embed_tokens.weight in
@@ -656,7 +713,12 @@ class TorchTitanEngine(BaseEngine):
         # individual expert weights for the locally-owned experts (e.g., 16 out of
         # 128 with EP=8). vLLM needs ALL experts. We gather the missing experts
         # by all-gathering each expert weight across the EP process group.
-        if self.parallel_dims.ep_enabled:
+        # The adapter half carries no expert tensors -- routed experts are 3-D
+        # GroupedExperts parameters and cannot be LoRA-wrapped -- so there is nothing
+        # for the EP gather to complete, and it is skipped rather than handed a dict it
+        # would find no expert keys in. The BASE half is the full model and still
+        # gathers.
+        if self.parallel_dims.ep_enabled and not (adapter_mode and base_sync_done):
             ep_mesh = self.parallel_dims.get_optional_mesh("ep")
             ep_group = ep_mesh.get_group()
             ep_size = self.parallel_dims.ep
@@ -672,8 +734,115 @@ class TorchTitanEngine(BaseEngine):
                 )
                 for name, param in params.items()
             )
-        # TODO: support Torchtitan PEFT
-        return per_tensor_param, None
+        return per_tensor_param, peft_config
+
+
+def _titan_lora_wrappers(module):
+    """``{fqn: wrapper}`` for every KimiLoRALinear in the module.
+
+    Discovered from the module rather than from the config, because ``apply_lora``
+    decides what actually got wrapped (its target list matches leaf names AND
+    qualified suffixes, and it skips the KDA subtree structurally). A config-derived
+    list would claim targets that were never wrapped.
+    """
+    found = {}
+    for name, sub in module.named_modules():
+        if (
+            hasattr(sub, "lora_a")
+            and hasattr(sub, "lora_b")
+            and hasattr(sub, "base")
+        ):
+            found[name] = sub
+    return found
+
+
+def _peft_config_from_wrappers(wrappers):
+    """A vLLM PEFTHelper-compatible dict, or None when there is nothing to describe.
+
+    ``target_modules`` is the set of leaf names actually wrapped. Our LoRA targets are
+    already HF-style leaf names (``q_proj``, ``o_proj``, ``gate_proj``, ...), so unlike
+    the megatron path there is no megatron-to-HF target rename to do.
+
+    rank and alpha come off a wrapper instead of the config: the wrapper stores
+    ``alpha / rank`` as ``_lora_scaling`` and its shapes carry the rank, so the values
+    reported are the ones the adapters were actually built with.
+    """
+    if not wrappers:
+        return None
+    from peft import TaskType
+
+    any_wrapper = next(iter(wrappers.values()))
+    rank = int(any_wrapper.lora_a.shape[0])
+    alpha = float(getattr(any_wrapper, "_lora_scaling", 1.0)) * rank
+    ranks = {int(w.lora_a.shape[0]) for w in wrappers.values()}
+    if len(ranks) > 1:
+        raise ValueError(
+            f"adapter-only sync needs one rank for all wrappers, got {sorted(ranks)}"
+        )
+    return {
+        "task_type": TaskType.CAUSAL_LM,
+        "r": rank,
+        "lora_alpha": alpha,
+        "target_modules": sorted({fqn.rsplit(".", 1)[-1] for fqn in wrappers}),
+        "exclude_modules": [],
+        "bias": "none",
+        "lora_dropout": 0.0,
+    }
+
+
+def _wrapped_hf_base_names(sd_adapter, wrappers, full_state_dict):
+    """``{fqn: hf_name}`` for each wrapped projection's BASE weight.
+
+    Uses the adapter's own key mapping rather than reimplementing it -- the vision /
+    text prefixing, the official-export renames and the ``.base.weight`` stripping all
+    live there, and a second copy of that logic is how the two drift apart. ``to_hf``
+    decides text-vs-multimodal from the WHOLE state dict, so ``_is_text_only`` is asked
+    once against the full dict; calling ``to_hf`` per key would let a one-entry dict
+    misclassify it and silently emit the wrong prefix.
+
+    ``to_hf`` itself cannot carry the adapters: it drops every ``lora_a`` / ``lora_b``
+    key by design, because the HF key space is the original Kimi architecture.
+    """
+    text_only = sd_adapter._is_text_only(full_state_dict)
+    return {
+        fqn: sd_adapter._tt_key_to_hf(f"{fqn}.weight", text_only) for fqn in wrappers
+    }
+
+
+def _adapter_state_dict(wrappers, hf_names):
+    """PEFT-named adapter tensors for the wrapped projections.
+
+    Exported UNSCALED: PEFT applies ``lora_alpha / r`` from the config it is handed, so
+    pre-multiplying by the wrapper's ``_lora_scaling`` would apply the scale twice.
+
+    Safe to ship the raw factors because the base mapping this borrows names from is a
+    pure RENAME for every LoRA target. The only value transform on the single-tensor
+    path is the 4-D ``A_log`` reshape, and ``apply_lora`` skips the KDA subtree
+    structurally, so no wrapped module is ever reshaped. Routed experts are likewise
+    out of reach -- they are 3-D GroupedExperts parameters, not ``nn.Linear``.
+    """
+    out = {}
+    for fqn, wrapper in wrappers.items():
+        stem = hf_names[fqn].removesuffix(".weight")
+        out[f"{stem}.lora_A.weight"] = wrapper.lora_a
+        out[f"{stem}.lora_B.weight"] = wrapper.lora_b
+    return out
+
+
+def _insert_base_layer_suffix(params, hf_names):
+    """Rename each wrapped projection's HF base key to PEFT's ``base_layer`` form.
+
+    The base sync ships the FULL model -- embeddings, norms, experts, everything -- and
+    only the wrapped projections change name, because those are the ones the rollout
+    engine will wrap with an adapter. Shipping only the wrapped bases would leave the
+    rollout without the rest of the model.
+    """
+    renamed = dict(params)
+    for hf_name in hf_names.values():
+        if hf_name in renamed:
+            stem = hf_name.removesuffix(".weight")
+            renamed[f"{stem}.base_layer.weight"] = renamed.pop(hf_name)
+    return renamed
 
 
 def _merged_state_dict_if_lora(module):
@@ -702,17 +871,16 @@ def _merged_state_dict_if_lora(module):
         return module.state_dict(), frozenset()
     from torchtitan.models.kimi_k3.lora import merge_lora_state_dict
 
-    # Merged, not adapter-mode, and that is forced rather than chosen: this engine
-    # returns peft_config=None, so engine_workers never takes its adapter path
-    # (do_lora_base_sync is gated on peft_config being present). A run configured
-    # with model.lora.merge=False still gets merged weights here.
+    # Merged because the run asked for it (model.lora.merge=True, the default). A run
+    # with merge=False takes the adapter-only path in get_per_tensor_param instead and
+    # never reaches here.
     # warning, not info: the first run of this shipped with logger.info and the line
     # never appeared, so "the merge ran" was inferred rather than read. Engagement has
     # to be assertable from the log.
     logger.warning(
         "weight sync: folding LoRA adapters into base weights before to_hf; "
-        "shipping the raw state dict would send the frozen base only. This engine "
-        "has no adapter-mode sync (peft_config is None), so merged is the only mode."
+        "shipping the raw state dict would send the frozen base only. Set "
+        "model.lora.merge=False for the adapter-only sync instead."
     )
     merged = merge_lora_state_dict(module)
     # Which keys the merge produced, so the checksum probe can pick one of THEM. It
