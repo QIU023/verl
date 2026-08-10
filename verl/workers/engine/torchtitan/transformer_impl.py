@@ -569,9 +569,11 @@ class TorchTitanEngine(BaseEngine):
             load_fsdp_model_to_gpu(module)
 
         params = {}
+        merged_lora_keys: set[str] = set()
         for module in self.module:
-            module_params = _merged_state_dict_if_lora(module)
+            module_params, module_merged = _merged_state_dict_if_lora(module)
             params.update(module_params)
+            merged_lora_keys.update(module_merged)
 
         # DIAGNOSTIC, off unless KIMI_GRPO_FREEZE_SYNC=1. Ships the FIRST step's
         # weights forever, so the rollout engine runs a stale policy while the actor
@@ -608,11 +610,21 @@ class TorchTitanEngine(BaseEngine):
         if _os.environ.get("KIMI_GRPO_SYNC_CHECKSUM", "1") == "1":
             import hashlib as _hl
 
+            # Prefer a key the LoRA merge produced: under LoRA everything else is
+            # frozen, so any other choice gives a constant digest and says nothing.
             probe = None
-            for k in sorted(params):
-                v = params[k]
-                if hasattr(v, "numel") and v.numel() > 1 and v.dtype.is_floating_point:
-                    probe = (k, v)
+            for keyset in (sorted(merged_lora_keys), sorted(params)):
+                for k in keyset:
+                    v = params.get(k)
+                    if (
+                        v is not None
+                        and hasattr(v, "numel")
+                        and v.numel() > 1
+                        and v.dtype.is_floating_point
+                    ):
+                        probe = (k, v)
+                        break
+                if probe is not None:
                     break
             if probe is not None:
                 k, v = probe
@@ -687,19 +699,28 @@ def _merged_state_dict_if_lora(module):
         for m in module.modules()
     )
     if not has_lora:
-        return module.state_dict()
+        return module.state_dict(), frozenset()
     from torchtitan.models.kimi_k3.lora import merge_lora_state_dict
 
     # Merged, not adapter-mode, and that is forced rather than chosen: this engine
     # returns peft_config=None, so engine_workers never takes its adapter path
     # (do_lora_base_sync is gated on peft_config being present). A run configured
     # with model.lora.merge=False still gets merged weights here.
-    logger.info(
+    # warning, not info: the first run of this shipped with logger.info and the line
+    # never appeared, so "the merge ran" was inferred rather than read. Engagement has
+    # to be assertable from the log.
+    logger.warning(
         "weight sync: folding LoRA adapters into base weights before to_hf; "
         "shipping the raw state dict would send the frozen base only. This engine "
         "has no adapter-mode sync (peft_config is None), so merged is the only mode."
     )
-    return merge_lora_state_dict(module)
+    merged = merge_lora_state_dict(module)
+    # Which keys the merge produced, so the checksum probe can pick one of THEM. It
+    # otherwise takes the first floating-point key in sorted order, which is
+    # embed_tokens.weight -- frozen under LoRA, so its checksum is constant whether the
+    # sync works or not. Measured: four syncs, four identical digests, proving nothing.
+    raw = set(module.state_dict())
+    return merged, frozenset(k for k in merged if k not in raw)
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
