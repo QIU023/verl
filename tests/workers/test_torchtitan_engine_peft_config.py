@@ -180,7 +180,14 @@ class TestTitanPeftConfig(unittest.TestCase):
         )
 
     def test_a_missing_base_key_is_not_invented(self):
-        """A wrapped projection absent from this rank's shard must not appear."""
+        """A wrapped projection absent from this rank's shard must not appear.
+
+        It also must not raise. Two absences are legitimate -- a PP rank does not own
+        every layer, and a graft-only target can have no HF destination because to_hf
+        drops what the original architecture has no key for -- so this warns with both
+        names instead. The silent version of this is what produced a KeyError from deep
+        inside vLLM's loader, with no indication of which projection disagreed.
+        """
         find, _, names, _, insert = _helpers()
         wrappers = find(_Model())
         hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
