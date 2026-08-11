@@ -803,9 +803,23 @@ def _wrapped_hf_base_names(sd_adapter, wrappers, full_state_dict):
     ``to_hf`` itself cannot carry the adapters: it drops every ``lora_a`` / ``lora_b``
     key by design, because the HF key space is the original Kimi architecture.
     """
+    from torchtitan.models.kimi_k3.lora import _state_dict_prefix
+
     text_only = sd_adapter._is_text_only(full_state_dict)
+    # The fqns come from named_modules(), which KEEPS wrapper segments that state_dict()
+    # strips: under activation checkpointing `layers.0.ffn.gate_proj` is
+    # `layers.0._checkpoint_wrapped_module.ffn.gate_proj` there. Composing a key from the
+    # module path then hands to_hf a name it has no mapping for --
+    #   ValueError: Unmapped tt key:
+    #   'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'
+    # which is exactly the failure merge_lora_state_dict already hit from the same
+    # direction. _state_dict_prefix is that fix; reusing it keeps one source of truth and
+    # makes it VALIDATE against the state dict instead of guessing a stripped name.
     return {
-        fqn: sd_adapter._tt_key_to_hf(f"{fqn}.weight", text_only) for fqn in wrappers
+        fqn: sd_adapter._tt_key_to_hf(
+            f"{_state_dict_prefix(fqn, full_state_dict)}.weight", text_only
+        )
+        for fqn in wrappers
     }
 
 
