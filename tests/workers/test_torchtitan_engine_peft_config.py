@@ -73,6 +73,22 @@ class _FakeAdapter:
         return f"model.{key}"
 
 
+def _sd(*fqns, wrapper: str | None = None):
+    """A state dict shaped like the real one: LoRA modules contribute base + adapters.
+
+    ``wrapper`` inserts an activation-checkpointing segment into the MODULE path only,
+    which is the asymmetry that caused the bug: named_modules() keeps it, state_dict()
+    strips it.
+    """
+    out = {}
+    for fqn in fqns:
+        out[f"{fqn}.base.weight"] = torch.zeros(1)
+        out[f"{fqn}.lora_a"] = torch.zeros(1)
+        out[f"{fqn}.lora_b"] = torch.zeros(1)
+    _ = wrapper
+    return out
+
+
 def _helpers():
     from verl.workers.engine.torchtitan.transformer_impl import (
         _adapter_state_dict,
@@ -123,7 +139,7 @@ class TestTitanPeftConfig(unittest.TestCase):
         with torch.no_grad():
             model.q_proj.lora_b.fill_(0.5)
         wrappers = find(model)
-        hf = names(_FakeAdapter(), wrappers, {})
+        hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
         out = adapters(wrappers, hf)
         self.assertEqual(
             sorted(out),
@@ -145,7 +161,7 @@ class TestTitanPeftConfig(unittest.TestCase):
     def test_base_half_keeps_everything_and_renames_only_the_wrapped(self):
         find, _, names, _, insert = _helpers()
         wrappers = find(_Model())
-        hf = names(_FakeAdapter(), wrappers, {})
+        hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
         params = {
             "model.q_proj.weight": torch.zeros(1),
             "model.o_proj.weight": torch.zeros(1),
@@ -167,7 +183,7 @@ class TestTitanPeftConfig(unittest.TestCase):
         """A wrapped projection absent from this rank's shard must not appear."""
         find, _, names, _, insert = _helpers()
         wrappers = find(_Model())
-        hf = names(_FakeAdapter(), wrappers, {})
+        hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
         out = insert({"model.q_proj.weight": torch.zeros(1)}, hf)
         self.assertEqual(sorted(out), ["model.q_proj.base_layer.weight"])
 
@@ -180,6 +196,35 @@ class TestTitanPeftConfig(unittest.TestCase):
                 cfg["lora_alpha"] / cfg["r"], alpha / rank, places=6
             )
             self.assertFalse(math.isnan(cfg["lora_alpha"]))
+
+
+class TestWrapperSegments(unittest.TestCase):
+    """named_modules() keeps wrapper segments that state_dict() strips.
+
+    Under activation checkpointing a module reached at
+    `layers.0._checkpoint_wrapped_module.ffn.gate_proj` appears in the state dict as
+    `layers.0.ffn.gate_proj`. Composing an HF name from the MODULE path then hands to_hf
+    something it cannot map:
+
+        ValueError: Unmapped tt key:
+        'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'
+
+    which is what a live GRPO adapter sync actually raised. merge_lora_state_dict already
+    hit this from the same direction, so the naming goes through torchtitan's
+    _state_dict_prefix rather than a second stripper here.
+    """
+
+    def test_a_checkpoint_wrapped_module_path_maps_to_the_stripped_name(self):
+        _, _, names, _, _ = _helpers()
+        module_path = "layers.0._checkpoint_wrapped_module.ffn.gate_proj"
+        state_dict_path = "layers.0.ffn.gate_proj"
+        hf = names(_FakeAdapter(), {module_path: object()}, _sd(state_dict_path))
+        self.assertEqual(hf[module_path], f"model.{state_dict_path}.weight")
+
+    def test_an_unrecognised_wrapper_raises_instead_of_guessing(self):
+        _, _, names, _, _ = _helpers()
+        with self.assertRaises(KeyError):
+            names(_FakeAdapter(), {"layers.0._mystery_wrap.ffn.gate_proj": object()}, {})
 
 
 if __name__ == "__main__":
