@@ -852,10 +852,35 @@ def _insert_base_layer_suffix(params, hf_names):
     rollout without the rest of the model.
     """
     renamed = dict(params)
-    for hf_name in hf_names.values():
+    missing = []
+    for fqn, hf_name in hf_names.items():
         if hf_name in renamed:
             stem = hf_name.removesuffix(".weight")
             renamed[f"{stem}.base_layer.weight"] = renamed.pop(hf_name)
+        else:
+            missing.append((fqn, hf_name))
+    if missing:
+        # Reported, not silent -- and a warning rather than a raise, which is a real
+        # distinction here. Two absences are legitimate: under PP a rank does not own
+        # every layer, and a graft-only target (the K3 attention gate) can have no HF
+        # destination at all because to_hf drops what the original architecture has no
+        # key for. Raising would break both.
+        #
+        # But a silent skip is what produced
+        #   KeyError: 'layers.0.self_attn.q_proj.weight'
+        # from deep inside vLLM's loader: the plain name shipped for a projection the
+        # rollout had LoRA-wrapped, whose params_dict holds q_proj.base_layer.weight.
+        # Naming both sides here is what makes that diagnosable at all.
+        shown = ", ".join(f"{fqn} -> {hf}" for fqn, hf in missing[:5])
+        logger.warning(
+            "weight sync: %d wrapped projection(s) have no matching key in the "
+            "converted state dict, so their bases ship un-suffixed. Legitimate under "
+            "PP or for graft-only targets; otherwise the rollout will look for "
+            "base_layer and fail. %s%s",
+            len(missing),
+            shown,
+            " ..." if len(missing) > 5 else "",
+        )
     return renamed
 
 
