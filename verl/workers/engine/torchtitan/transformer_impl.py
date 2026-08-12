@@ -852,6 +852,12 @@ def _adapter_state_dict(wrappers, hf_names):
 # is a wider set than the one torchtitan wrapped. K3 diverges on the KDA subtree, which
 # `apply_lora` skips structurally while vLLM wraps it anyway.
 #
+# The set is decided by one question per key: is its vLLM destination a LinearBase
+# subclass? Not "does the name look like a projection" -- the KDA short conv is named
+# conv1d and is a ColumnParallelLinear, while embeddings and lm_head are linear-shaped and
+# are NOT wrapped, because K3 declares no embedding_modules. Norms, A_log and dt_bias are
+# parameters of non-linear modules and stay plain.
+#
 # These are the K3 linear projections absent from verl's shared STACKED_PARAMS. The
 # rename applies to the SOURCE name and vLLM's stacked mapping is a substring replace,
 # so `.q_proj.base_layer.weight` still resolves to `.in_proj_qkvgfab.base_layer.weight`.
@@ -864,10 +870,29 @@ _K3_STACKED_PARAMS = (
     ".f_a_proj.weight",
     ".f_b_proj.weight",
     ".g_proj.weight",
+    # KDA short convolution. vLLM models it AS a linear -- `self.conv1d =
+    # ColumnParallelLinear(...)`, unsqueezed to conv layout afterwards -- so it is
+    # LoRA-wrapped like any projection. Reading the name is not enough here.
+    ".q_conv1d.weight",
+    ".k_conv1d.weight",
+    ".v_conv1d.weight",
     # Block AttnRes graft
     ".self_attention_res_proj.weight",
     ".output_attn_res_proj.weight",
     ".mlp_res_proj.weight",
+    # Latent MoE shared W_down / W_up (report Eq. 11), ReplicatedLinear in vLLM.
+    ".routed_expert_down_proj.weight",
+    ".routed_expert_up_proj.weight",
+    # Per-expert weights. These are NOT a linear vLLM wraps -- they land in FusedMoE's
+    # stacked w13/w2 params -- but the expert mapping ASKS for the base_layer form:
+    #     f"experts.{logical_id}.{weight_name}.{lora_base_layer_prefix}"
+    # with the prefix set from `any(".base_layer." in n for n in model.named_parameters())`.
+    # So one LoRA-wrapped module anywhere in the model changes what the expert loader
+    # expects every expert key to be called, and an un-suffixed expert key matches no
+    # mapping entry at all rather than mismatching one.
+    ".w1.weight",
+    ".w2.weight",
+    ".w3.weight",
     # MoE router: GateLinear(ReplicatedLinear). STACKED_PARAMS spells this `.mlp.gate.`,
     # which K3 does not use.
     ".block_sparse_moe.gate.weight",

@@ -208,17 +208,79 @@ class TestTitanPeftConfig(unittest.TestCase):
             self.assertIn(f"{stem}.base_layer.{suffix}", out, name)
 
     def test_the_ones_that_are_not_linear_keep_their_names(self):
-        """Renaming a norm or a conv would point it at a base_layer that never exists."""
+        """Renaming a norm would point it at a base_layer that never exists.
+
+        `q_conv1d` deliberately is NOT in here: vLLM builds the KDA short conv as a
+        ColumnParallelLinear, so it IS wrapped. Reading module names instead of module
+        types is what put it here in the first version of this test.
+        """
         _, _, _, _, insert = _helpers()
         params = {
-            "model.layers.0.self_attn.q_conv1d.weight": torch.zeros(1),
             "model.layers.0.self_attn.o_norm.weight": torch.zeros(1),
             "model.layers.0.self_attn.A_log": torch.zeros(1),
             "model.layers.0.input_layernorm.weight": torch.zeros(1),
-            "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.zeros(1),
             "lm_head.weight": torch.zeros(1),
         }
         self.assertEqual(sorted(insert(params, "kimi_k3")), sorted(params))
+
+    def test_every_key_the_text_stack_ships_is_classified(self):
+        """The whole HF key space at once, so this stops being found one KeyError at a time.
+
+        Left column is every distinct leaf name in the k3mini export (1032 keys, 41
+        distinct leaves); right column is whether its vLLM destination is a LinearBase
+        subclass and therefore LoRA-wrapped. Two of these are not guessable from the name:
+        `conv1d` IS a ColumnParallelLinear in vLLM, and `embed_tokens` / `lm_head` are NOT
+        wrapped because K3 declares no `embedding_modules`.
+        """
+        _, _, _, _, insert = _helpers()
+        renamed = {
+            # MLA and KDA projections
+            "q_proj", "k_proj", "v_proj", "o_proj", "b_proj", "g_proj",
+            "f_a_proj", "f_b_proj", "q_a_proj", "q_b_proj",
+            "kv_a_proj_with_mqa", "kv_b_proj",
+            # short conv, modelled as a linear
+            "q_conv1d", "k_conv1d", "v_conv1d",
+            # dense FFN and latent MoE
+            "gate_proj", "up_proj", "down_proj",
+            "routed_expert_down_proj", "routed_expert_up_proj",
+            # Block AttnRes graft
+            "self_attention_res_proj", "output_attn_res_proj", "mlp_res_proj",
+        }
+        plain = {
+            "input_layernorm", "post_attention_layernorm", "q_a_layernorm",
+            "kv_a_layernorm", "o_norm", "mlp_res_norm", "output_attn_res_norm",
+            "self_attention_res_norm", "routed_expert_norm",
+            "embed_tokens", "lm_head", "norm",
+        }
+        params = {f"model.layers.0.{leaf}.weight": torch.zeros(1) for leaf in renamed | plain}
+        # The router and its correction bias hang off block_sparse_moe. The per-expert
+        # weights are renamed too, for a different reason than the projections: FusedMoE's
+        # expert mapping builds its weight_name WITH the base_layer prefix whenever the
+        # model has any base_layer parameter, so an un-suffixed expert key matches no
+        # mapping entry and falls through to the plain-name lookup.
+        params["model.layers.0.block_sparse_moe.gate.weight"] = torch.zeros(1)
+        params["model.layers.0.block_sparse_moe.gate.e_score_correction_bias"] = torch.zeros(1)
+        params["model.layers.0.self_attn.A_log"] = torch.zeros(1)
+        params["model.layers.0.self_attn.dt_bias"] = torch.zeros(1)
+        for w in ("w1", "w2", "w3"):
+            params[f"model.layers.0.block_sparse_moe.experts.0.{w}.weight"] = torch.zeros(1)
+
+        out = insert(params, "kimi_k3")
+        for leaf in sorted(renamed):
+            self.assertIn(f"model.layers.0.{leaf}.base_layer.weight", out, leaf)
+        for leaf in sorted(plain):
+            self.assertIn(f"model.layers.0.{leaf}.weight", out, leaf)
+        self.assertIn("model.layers.0.block_sparse_moe.gate.base_layer.weight", out)
+        self.assertIn(
+            "model.layers.0.block_sparse_moe.gate.base_layer.e_score_correction_bias", out
+        )
+        self.assertIn("model.layers.0.self_attn.A_log", out)
+        self.assertIn("model.layers.0.self_attn.dt_bias", out)
+        for w in ("w1", "w2", "w3"):
+            self.assertIn(
+                f"model.layers.0.block_sparse_moe.experts.0.{w}.base_layer.weight", out, w
+            )
+        self.assertEqual(len(out), len(params))
 
     def test_the_rename_survives_vllms_stacked_substring_replace(self):
         """The suffix goes on the SOURCE name, so the mapping has to compose.
