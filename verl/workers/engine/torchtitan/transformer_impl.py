@@ -50,6 +50,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
+from verl.utils.megatron_peft_utils import add_base_layer_suffix
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
@@ -690,7 +691,9 @@ class TorchTitanEngine(BaseEngine):
                 # Second half of the sequence: only what LoRA learned goes over.
                 params = _adapter_state_dict(wrappers, hf_names)
             else:
-                params = _insert_base_layer_suffix(params, hf_names)
+                params = _insert_base_layer_suffix(
+                    params, getattr(self.model_config.hf_config, "model_type", "")
+                )
             logger.warning(
                 "weight sync: adapter mode, base_sync_done=%s, shipping %d tensors "
                 "(rank %d, %d wrapped projections)",
@@ -843,45 +846,48 @@ def _adapter_state_dict(wrappers, hf_names):
     return out
 
 
-def _insert_base_layer_suffix(params, hf_names):
-    """Rename each wrapped projection's HF base key to PEFT's ``base_layer`` form.
+# vLLM wraps EVERY linear layer when LoRA is enabled -- `get_supported_lora_modules`
+# collects leaf names by module TYPE, not from the adapter's target_modules -- so the
+# base half has to name a projection `base_layer` whenever the ROLLOUT wrapped it, which
+# is a wider set than the one torchtitan wrapped. K3 diverges on the KDA subtree, which
+# `apply_lora` skips structurally while vLLM wraps it anyway.
+#
+# These are the K3 linear projections absent from verl's shared STACKED_PARAMS. The
+# rename applies to the SOURCE name and vLLM's stacked mapping is a substring replace,
+# so `.q_proj.base_layer.weight` still resolves to `.in_proj_qkvgfab.base_layer.weight`.
+# Getting one wrong is not silent: the destination misses params_dict, vLLM's stacked
+# loop treats that as "packed projection not present on this layer" and falls through to
+# the plain path, and the KeyError there names the projection.
+_K3_STACKED_PARAMS = (
+    # KDA, fused into in_proj_qkvgfab (q/k/v/b/f_a/g) plus its own f_b_proj
+    ".b_proj.weight",
+    ".f_a_proj.weight",
+    ".f_b_proj.weight",
+    ".g_proj.weight",
+    # Block AttnRes graft
+    ".self_attention_res_proj.weight",
+    ".output_attn_res_proj.weight",
+    ".mlp_res_proj.weight",
+    # MoE router: GateLinear(ReplicatedLinear). STACKED_PARAMS spells this `.mlp.gate.`,
+    # which K3 does not use.
+    ".block_sparse_moe.gate.weight",
+    ".block_sparse_moe.gate.e_score_correction_bias",
+)
+
+
+def _insert_base_layer_suffix(params, model_type):
+    """Rename each LoRA-wrappable projection's HF base key to PEFT's ``base_layer`` form.
 
     The base sync ships the FULL model -- embeddings, norms, experts, everything -- and
-    only the wrapped projections change name, because those are the ones the rollout
-    engine will wrap with an adapter. Shipping only the wrapped bases would leave the
-    rollout without the rest of the model.
+    only the projections the rollout wraps change name.
     """
-    renamed = dict(params)
-    missing = []
-    for fqn, hf_name in hf_names.items():
-        if hf_name in renamed:
-            stem = hf_name.removesuffix(".weight")
-            renamed[f"{stem}.base_layer.weight"] = renamed.pop(hf_name)
-        else:
-            missing.append((fqn, hf_name))
-    if missing:
-        # Reported, not silent -- and a warning rather than a raise, which is a real
-        # distinction here. Two absences are legitimate: under PP a rank does not own
-        # every layer, and a graft-only target (the K3 attention gate) can have no HF
-        # destination at all because to_hf drops what the original architecture has no
-        # key for. Raising would break both.
-        #
-        # But a silent skip is what produced
-        #   KeyError: 'layers.0.self_attn.q_proj.weight'
-        # from deep inside vLLM's loader: the plain name shipped for a projection the
-        # rollout had LoRA-wrapped, whose params_dict holds q_proj.base_layer.weight.
-        # Naming both sides here is what makes that diagnosable at all.
-        shown = ", ".join(f"{fqn} -> {hf}" for fqn, hf in missing[:5])
-        logger.warning(
-            "weight sync: %d wrapped projection(s) have no matching key in the "
-            "converted state dict, so their bases ship un-suffixed. Legitimate under "
-            "PP or for graft-only targets; otherwise the rollout will look for "
-            "base_layer and fail. %s%s",
-            len(missing),
-            shown,
-            " ..." if len(missing) > 5 else "",
+    return dict(
+        add_base_layer_suffix(
+            params.items(),
+            model_type=model_type,
+            extra_stacked_params=_K3_STACKED_PARAMS,
         )
-    return renamed
+    )
 
 
 def _merged_state_dict_if_lora(module):

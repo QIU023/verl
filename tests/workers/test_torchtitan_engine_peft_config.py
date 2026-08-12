@@ -23,9 +23,9 @@ bought no sync bandwidth at all. These pin the three things that decision rests 
   target-module names that were actually wrapped;
 * the adapter half emits PEFT's ``lora_A`` / ``lora_B`` names and the raw, UNSCALED
   factors, because PEFT re-applies ``lora_alpha / r`` from the config;
-* the base half is the FULL model with ``base_layer`` inserted only on wrapped
-  projections -- shipping just the wrapped bases would leave the rollout without
-  embeddings, norms or experts.
+* the base half is the FULL model -- shipping just the wrapped bases would leave the
+  rollout without embeddings, norms or experts -- with ``base_layer`` inserted on every
+  projection the ROLLOUT wraps, which is a wider set than the one torchtitan wrapped.
 
 CPU only: these exercise the naming and config helpers directly, with no process group,
 no GPU and no rollout engine.
@@ -158,41 +158,85 @@ class TestTitanPeftConfig(unittest.TestCase):
         self.assertEqual(out["model.q_proj.lora_A.weight"].shape, (8, 4))
         self.assertEqual(out["model.q_proj.lora_B.weight"].shape, (4, 8))
 
-    def test_base_half_keeps_everything_and_renames_only_the_wrapped(self):
-        find, _, names, _, insert = _helpers()
-        wrappers = find(_Model())
-        hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
+    def test_base_half_keeps_everything_and_renames_the_projections(self):
+        _, _, _, _, insert = _helpers()
         params = {
-            "model.q_proj.weight": torch.zeros(1),
-            "model.o_proj.weight": torch.zeros(1),
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(1),
+            "model.layers.0.self_attn.o_proj.weight": torch.zeros(1),
             "model.norm.weight": torch.zeros(1),
             "model.embed_tokens.weight": torch.zeros(1),
         }
-        out = insert(params, hf)
+        out = insert(params, "kimi_k3")
         self.assertEqual(
             sorted(out),
             [
                 "model.embed_tokens.weight",
+                "model.layers.0.self_attn.o_proj.base_layer.weight",
+                "model.layers.0.self_attn.q_proj.base_layer.weight",
                 "model.norm.weight",
-                "model.o_proj.base_layer.weight",
-                "model.q_proj.base_layer.weight",
             ],
         )
 
-    def test_a_missing_base_key_is_not_invented(self):
-        """A wrapped projection absent from this rank's shard must not appear.
+    def test_projections_torchtitan_did_not_wrap_are_still_renamed(self):
+        """The rollout decides this set, not the trainer, and the two differ.
 
-        It also must not raise. Two absences are legitimate -- a PP rank does not own
-        every layer, and a graft-only target can have no HF destination because to_hf
-        drops what the original architecture has no key for -- so this warns with both
-        names instead. The silent version of this is what produced a KeyError from deep
-        inside vLLM's loader, with no indication of which projection disagreed.
+        vLLM's ``get_supported_lora_modules`` collects leaf names by module TYPE -- "in
+        vLLM, all linear layers support LoRA" -- so enabling LoRA wraps EVERY linear
+        regardless of the adapter's target_modules. ``apply_lora`` skips K3's KDA subtree
+        structurally, so a KDA ``q_proj`` is unwrapped on the trainer side and wrapped on
+        the rollout side.
+
+        Naming that key from the trainer's wrapper set shipped the plain name into a
+        params_dict that only had ``base_layer``, and vLLM's stacked loop reads a missing
+        destination as "packed projection not present on this layer" and falls through to
+        the plain path -- which is how this surfaced as
+        ``KeyError: 'layers.0.self_attn.q_proj.weight'`` with nothing pointing at LoRA.
         """
-        find, _, names, _, insert = _helpers()
-        wrappers = find(_Model())
-        hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
-        out = insert({"model.q_proj.weight": torch.zeros(1)}, hf)
-        self.assertEqual(sorted(out), ["model.q_proj.base_layer.weight"])
+        _, _, _, _, insert = _helpers()
+        # Nothing here is wrapped by torchtitan; every one is a linear vLLM wraps.
+        params = {
+            "model.layers.0.self_attn.q_proj.weight": torch.zeros(1),
+            "model.layers.0.self_attn.f_a_proj.weight": torch.zeros(1),
+            "model.layers.0.self_attn.b_proj.weight": torch.zeros(1),
+            "model.layers.0.self_attention_res_proj.weight": torch.zeros(1),
+            "model.layers.0.block_sparse_moe.gate.weight": torch.zeros(1),
+            "model.layers.0.block_sparse_moe.gate.e_score_correction_bias": torch.zeros(1),
+        }
+        out = insert(params, "kimi_k3")
+        for name in params:
+            stem, _, suffix = name.rpartition(".")
+            self.assertIn(f"{stem}.base_layer.{suffix}", out, name)
+
+    def test_the_ones_that_are_not_linear_keep_their_names(self):
+        """Renaming a norm or a conv would point it at a base_layer that never exists."""
+        _, _, _, _, insert = _helpers()
+        params = {
+            "model.layers.0.self_attn.q_conv1d.weight": torch.zeros(1),
+            "model.layers.0.self_attn.o_norm.weight": torch.zeros(1),
+            "model.layers.0.self_attn.A_log": torch.zeros(1),
+            "model.layers.0.input_layernorm.weight": torch.zeros(1),
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.zeros(1),
+            "lm_head.weight": torch.zeros(1),
+        }
+        self.assertEqual(sorted(insert(params, "kimi_k3")), sorted(params))
+
+    def test_the_rename_survives_vllms_stacked_substring_replace(self):
+        """The suffix goes on the SOURCE name, so the mapping has to compose.
+
+        vLLM maps a source projection onto its packed destination with
+        ``name.replace(weight_name, param_name)``. That is a substring replace on the
+        module segment, which is the only reason renaming the source is sound: the
+        inserted ``base_layer`` sits after the segment being replaced and survives it.
+        """
+        _, _, _, _, insert = _helpers()
+        renamed = insert(
+            {"model.layers.0.self_attn.q_proj.weight": torch.zeros(1)}, "kimi_k3"
+        )
+        (name,) = renamed
+        self.assertEqual(
+            name.replace(".q_proj", ".in_proj_qkvgfab"),
+            "model.layers.0.self_attn.in_proj_qkvgfab.base_layer.weight",
+        )
 
     def test_scaling_round_trip_matches_the_wrapper_math(self):
         """alpha recovered from the wrapper must reproduce its own scaling."""

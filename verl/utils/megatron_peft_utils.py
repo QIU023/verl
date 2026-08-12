@@ -13,6 +13,7 @@
 # limitations under the License.
 """Utilities for PEFT (Parameter-Efficient Fine-Tuning) of Megatron in VERL."""
 
+from collections.abc import Sequence
 from typing import Iterator
 
 import torch
@@ -159,17 +160,23 @@ def build_peft_config_for_vllm(lora_config: dict) -> dict:
 def add_base_layer_suffix(
     params: Iterator[tuple[str, torch.Tensor]],
     model_type: str,
+    extra_stacked_params: Sequence[str] = (),
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield param pairs with a base-layer suffix added to the param name.
 
     Args:
         params: Iterator of (param_name, tensor)
         model_type: The type of the model (e.g., "llama").
+        extra_stacked_params: Additional name suffixes to treat as stacked, for
+            architectures whose linear projections are not in ``STACKED_PARAMS``.
+            The list is architecture-specific because vLLM wraps EVERY linear layer
+            when LoRA is enabled, so a projection missing from it keeps its plain name
+            and the rollout then looks up a key its params_dict no longer has.
     """
-    stacked_params = STACKED_PARAMS
+    stacked_params = [*STACKED_PARAMS, *extra_stacked_params]
     # TODO: other models may have more special treatment, or integrate this into Megatron-Bridge
     if model_type == "llama":
-        stacked_params = [".embed_tokens.weight", *STACKED_PARAMS]
+        stacked_params = [".embed_tokens.weight", *stacked_params]
     for name, param in params:
         ending_suffix = ""
         for suffix in stacked_params:
