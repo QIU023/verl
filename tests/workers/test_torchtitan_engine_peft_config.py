@@ -254,10 +254,9 @@ class TestTitanPeftConfig(unittest.TestCase):
         }
         params = {f"model.layers.0.{leaf}.weight": torch.zeros(1) for leaf in renamed | plain}
         # The router and its correction bias hang off block_sparse_moe. The per-expert
-        # weights are renamed too, for a different reason than the projections: FusedMoE's
-        # expert mapping builds its weight_name WITH the base_layer prefix whenever the
-        # model has any base_layer parameter, so an un-suffixed expert key matches no
-        # mapping entry and falls through to the plain-name lookup.
+        # weights keep their plain names: RoutedExperts is a PluggableLayer, so LoRA never
+        # wraps it. vLLM's expert mapping asked for the base_layer form from a global
+        # probe, which was a bug on that side rather than a contract on this one.
         params["model.layers.0.block_sparse_moe.gate.weight"] = torch.zeros(1)
         params["model.layers.0.block_sparse_moe.gate.e_score_correction_bias"] = torch.zeros(1)
         params["model.layers.0.self_attn.A_log"] = torch.zeros(1)
@@ -277,9 +276,7 @@ class TestTitanPeftConfig(unittest.TestCase):
         self.assertIn("model.layers.0.self_attn.A_log", out)
         self.assertIn("model.layers.0.self_attn.dt_bias", out)
         for w in ("w1", "w2", "w3"):
-            self.assertIn(
-                f"model.layers.0.block_sparse_moe.experts.0.{w}.base_layer.weight", out, w
-            )
+            self.assertIn(f"model.layers.0.block_sparse_moe.experts.0.{w}.weight", out, w)
         self.assertEqual(len(out), len(params))
 
     def test_the_rename_survives_vllms_stacked_substring_replace(self):

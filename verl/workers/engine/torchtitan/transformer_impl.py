@@ -883,16 +883,12 @@ _K3_STACKED_PARAMS = (
     # Latent MoE shared W_down / W_up (report Eq. 11), ReplicatedLinear in vLLM.
     ".routed_expert_down_proj.weight",
     ".routed_expert_up_proj.weight",
-    # Per-expert weights. These are NOT a linear vLLM wraps -- they land in FusedMoE's
-    # stacked w13/w2 params -- but the expert mapping ASKS for the base_layer form:
-    #     f"experts.{logical_id}.{weight_name}.{lora_base_layer_prefix}"
-    # with the prefix set from `any(".base_layer." in n for n in model.named_parameters())`.
-    # So one LoRA-wrapped module anywhere in the model changes what the expert loader
-    # expects every expert key to be called, and an un-suffixed expert key matches no
-    # mapping entry at all rather than mismatching one.
-    ".w1.weight",
-    ".w2.weight",
-    ".w3.weight",
+    # The per-expert w1/w2/w3 are deliberately NOT here. RoutedExperts is a
+    # PluggableLayer, not a linear, so LoRA never wraps it and its params keep their plain
+    # names. vLLM's expert mapping did demand the base_layer form, but from a GLOBAL
+    # `any(".base_layer." in n for n in model.named_parameters())` probe -- true as soon as
+    # any projection is wrapped -- which made it ask for a destination that does not exist.
+    # Fixed on the vLLM side by scoping that probe to the routed-expert params.
     # MoE router: GateLinear(ReplicatedLinear). STACKED_PARAMS spells this `.mlp.gate.`,
     # which K3 does not use.
     ".block_sparse_moe.gate.weight",
