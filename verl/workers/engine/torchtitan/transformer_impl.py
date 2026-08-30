@@ -27,9 +27,9 @@ import torch
 import torch.distributed
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
@@ -188,6 +188,9 @@ class TorchTitanEngine(BaseEngine):
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
+        # The kimi_k3 standard token dispatcher synchronizes with the CPU,
+        # which CUDA graphs cannot capture; run eager under expert parallel.
+        training_kwargs["disable_cuda_graphs"] = True
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
         if self.engine_config.offload_policy or self.engine_config.forward_only:
@@ -437,7 +440,20 @@ class TorchTitanEngine(BaseEngine):
         else:
             # Non-PP forward. train_context (SPMD mesh) is set by the caller.
             assert len(model_parts) == 1
-            pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+            folded = getattr(model_parts[0], "folded_token_stream", False)
+            if folded and inputs.dim() == 2 and inputs.shape[0] == 1:
+                # Folded-stream models (kimi_k3) take [T] token streams; the
+                # rmpad path packs to [1, T]. Fold in, unfold the logits out.
+                squeezed_inputs = inputs.squeeze(0)
+                squeezed_extra = {
+                    k: (v.squeeze(0) if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == 1 else v)
+                    for k, v in (extra_inputs or {}).items()
+                }
+                pred = model_parts[0](squeezed_inputs, **squeezed_extra, **extra_kwargs)
+                if pred.dim() == 2:
+                    pred = pred.unsqueeze(0)
+            else:
+                pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
@@ -1083,7 +1099,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 extra_kwargs,
                 self.parallel_dims.get_mesh("cp"),
                 self.trainer.device,
-                self.trainer.config.parallelism.context_parallel_load_balancer,
+                # NO_PADDING packs variable-length sequences, so the
+                # head-tail balancer's seq % (2*cp) == 0 precondition cannot
+                # hold; shard contiguously.
+                None,
             )
             labels = labels_full
             extra_inputs["positions"] = extra_kwargs.pop("positions")

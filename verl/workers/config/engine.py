@@ -480,7 +480,7 @@ class TorchtitanEngineConfig(EngineConfig):
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )
-        assert self.spmd_backend in ["default", "full_dtensor", "spmd_types"], (
+        assert self.spmd_backend in ["default", "full_dtensor", "spmd_types", "partial_dtensor"], (
             f"spmd_backend {self.spmd_backend} not supported"
         )
         assert self.activation_checkpoint in ["selective", "full", "none"], (

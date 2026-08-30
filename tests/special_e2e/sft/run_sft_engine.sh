@@ -100,6 +100,7 @@ TORCHTITAN_ENGINE_CONFIG="\
     engine=${backend} \
     model=hf_model \
     model.path=${MODEL_PATH} \
+    model.trust_remote_code=True \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -113,12 +114,15 @@ TORCHTITAN_ENGINE_CONFIG="\
     engine.pipeline_parallel_size=${PP_SIZE} \
     engine.context_parallel_size=${CP_SIZE} \
     engine.data_parallel_shard_size=${FSDP_SIZE} \
-    engine.use_torch_compile=False"
+    engine.use_torch_compile=False \
+    engine.spmd_backend=partial_dtensor \
+    engine.expert_parallel_size=${EP_SIZE:-1}"
 
 AUTOMODEL_ENGINE_CONFIG="\
     engine=${backend} \
     model=hf_model \
     model.path=${MODEL_PATH} \
+    model.trust_remote_code=True \
     optim=${backend} \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.2 \
@@ -129,7 +133,9 @@ AUTOMODEL_ENGINE_CONFIG="\
     optim.lr_scheduler_type=cosine \
     engine.tp_size=${TP_SIZE} \
     engine.cp_size=${CP_SIZE} \
-    engine.use_torch_compile=False"
+    engine.use_torch_compile=False \
+    engine.spmd_backend=partial_dtensor \
+    engine.expert_parallel_size=${EP_SIZE:-1}"
 
 
 if [ "$backend" = "fsdp" ]; then
