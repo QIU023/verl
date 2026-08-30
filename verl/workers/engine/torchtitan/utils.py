@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.nn.attention.flex_attention import _mask_mod_signature, and_masks
-from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     VarlenMetadata,
@@ -149,9 +149,11 @@ def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
             f"Expected a dict attribute ending with '_configs'."
         )
 
-    hidden_size = hf_config.hidden_size
-    num_layers = hf_config.num_hidden_layers
-    vocab_size = hf_config.vocab_size
+    # Multimodal configs (e.g. kimi_k3) nest the decoder under text_config.
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    hidden_size = text_config.hidden_size
+    num_layers = text_config.num_hidden_layers
+    vocab_size = text_config.vocab_size
 
     for flavor_name in flavor_names:
         cfg = model_registry(flavor_name).model
