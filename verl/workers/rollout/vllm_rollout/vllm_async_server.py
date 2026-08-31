@@ -92,7 +92,10 @@ if _VLLM_VERSION > version.parse("0.11.0"):
     if get_encoding is not None and os.getenv("VERL_USE_GPT_OSS", "0") == "1":
         get_encoding()
 else:
-    from vllm.utils import FlexibleArgumentParser
+    try:
+        from vllm.utils import FlexibleArgumentParser
+    except ImportError:  # moved in vllm >= 1.0.0.dev20260801
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 logger = logging.getLogger(__file__)
