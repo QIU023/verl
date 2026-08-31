@@ -1072,7 +1072,45 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # dict as extra_inputs are not forwarded to other stages in PP, but
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
+        cp_pad_len = 0
         if self.parallel_dims.cp_enabled:
+            # Context parallel wants a sequence it can cut evenly, and the
+            # flex BlockMask wants each shard to be a whole number of 128-token
+            # blocks; a packed no-padding stream is neither. Pad the stream up
+            # to the multiple both need, and drop those rows from the logits
+            # after the model call (prepare_model_outputs) so the loss still
+            # sees only real tokens.
+            cp_size = self.parallel_dims.cp
+            multiple = cp_size if self._model_cp_is_module_internal else cp_size * 2 * 128
+            seq_len = input_ids.shape[1]
+            cp_pad_len = (-seq_len) % multiple
+            if cp_pad_len:
+                pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+                input_ids = torch.nn.functional.pad(input_ids, (0, cp_pad_len), value=pad_id)
+                # Labels for the pad rows are never read: the loss indexes by
+                # the true offsets, and the logits are unpadded before it runs.
+                labels = torch.nn.functional.pad(labels, (0, cp_pad_len), value=pad_id)
+                # Padding continues the last position rather than restarting at
+                # zero: a fresh zero would read as a new document to any
+                # position-derived mask.
+                if position_ids.dim() == 3:
+                    tail = position_ids[..., -1:] + torch.arange(
+                        1, cp_pad_len + 1, device=position_ids.device
+                    )
+                    position_ids = torch.cat([position_ids, tail], dim=-1)
+                else:
+                    tail = position_ids[:, -1:] + torch.arange(
+                        1, cp_pad_len + 1, device=position_ids.device
+                    )
+                    position_ids = torch.cat([position_ids, tail], dim=1)
+                extra_inputs["positions"] = position_ids
+                if attention_mask is not None:
+                    attention_mask = get_attention_masks(
+                        input_batch=input_ids,
+                        positions=position_ids,
+                        attn_type=self.engine_config.attn_type,
+                    )
+                    extra_kwargs["attention_masks"] = attention_mask
             # prepare_context_parallel_input contract: positions must ride
             # in extra_kwargs (it seq-shards them alongside inputs/labels);
             # this engine keeps positions in extra_inputs, so bridge them
@@ -1093,6 +1131,19 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             # engine all-gathers the seq-sharded logits after the model
             # call (model_forward_step) instead of sharding the loss side.
             labels_full = labels
+            # cp_shard cuts dim 0 and this stream is [1, T] -- dim 0 is the
+            # fold, not the sequence, so sharding it hands every rank but the
+            # first an empty batch. Fold the stream down to [T] for the cut
+            # (the model's own contract anyway) and unfold after.
+            folded_for_cp = input_ids.dim() == 2 and input_ids.shape[0] == 1
+            if folded_for_cp:
+                input_ids = input_ids.squeeze(0)
+                labels = labels.squeeze(0)
+                positions = extra_kwargs["positions"]
+                extra_kwargs["positions"] = (
+                    positions.squeeze(0) if positions.dim() > 1 and positions.shape[0] == 1
+                    else positions
+                )
             input_ids, _labels_sharded, extra_kwargs = prepare_context_parallel_input(
                 input_ids,
                 labels,
@@ -1106,12 +1157,18 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             )
             labels = labels_full
             extra_inputs["positions"] = extra_kwargs.pop("positions")
+            if folded_for_cp:
+                # Back to the rmpad layout the rest of the engine expects.
+                input_ids = input_ids.unsqueeze(0)
+                if extra_inputs["positions"].dim() == 1:
+                    extra_inputs["positions"] = extra_inputs["positions"].unsqueeze(0)
             if masks is not None:
                 extra_kwargs["attention_masks"] = masks
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
         output_args["labels"] = labels
+        output_args["cp_pad_len"] = cp_pad_len
         return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
@@ -1122,6 +1179,12 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         temperature = micro_batch["temperature"]
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
         labels = output_args["labels"]
+        # Drop the rows the CP padding added, so everything below sees the
+        # packed stream at its true length (see prepare_model_inputs).
+        cp_pad_len = output_args.get("cp_pad_len", 0)
+        if cp_pad_len:
+            logits = logits[:, :-cp_pad_len]
+            labels = labels[:, :-cp_pad_len]
         model_output = {}
 
         input_ids = micro_batch["input_ids"]
