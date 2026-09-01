@@ -35,6 +35,8 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+
+from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
 
@@ -461,11 +463,9 @@ class TorchTitanEngine(BaseEngine):
             # Inputs were seq-sharded across cp; the loss side works on
             # full sequences (see prepare_model_inputs), so gather the
             # logits back (differentiable -> reduce-scatter backward).
-            import torch.distributed.nn.functional as dist_nn
-
             cp_group = parallel_dims.get_mesh("cp").get_group()
-            pred = torch.cat(
-                dist_nn.all_gather(pred.contiguous(), group=cp_group), dim=1
+            pred = gather_outputs_and_unpad(
+                pred.contiguous(), gather_dim=1, group=cp_group
             )
         return pred
 
@@ -1074,35 +1074,40 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
         cp_pad_len = 0
         if self.parallel_dims.cp_enabled:
-            # Context parallel wants a sequence it can cut evenly, and the
-            # flex BlockMask wants each shard to be a whole number of 128-token
-            # blocks; a packed no-padding stream is neither. Pad the stream up
-            # to the multiple both need, and drop those rows from the logits
-            # after the model call (prepare_model_outputs) so the loss still
-            # sees only real tokens.
+            # Context parallel wants a sequence it can cut evenly, and the flex
+            # BlockMask wants each shard to be a whole number of 128-token
+            # blocks; a packed no-padding stream is neither. ulysses_pad does
+            # the padding, with two adjustments this engine needs.
+            #
+            # The multiple: ulysses_pad pads to the parallel degree, which is
+            # what a model whose CP lives inside its own modules needs; a model
+            # whose CP goes through the flex BlockMask needs whole blocks per
+            # shard, so the modulus handed to it is cp * 2 * 128 there.
             cp_size = self.parallel_dims.cp
             multiple = cp_size if self._model_cp_is_module_internal else cp_size * 2 * 128
-            seq_len = input_ids.shape[1]
-            cp_pad_len = (-seq_len) % multiple
+            pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+            input_ids, position_ids, cp_pad_len = ulysses_pad(
+                input_ids, position_ids, sp_size=multiple, pad_value=pad_id
+            )
             if cp_pad_len:
-                pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
-                input_ids = torch.nn.functional.pad(input_ids, (0, cp_pad_len), value=pad_id)
-                # Labels for the pad rows are never read: the loss indexes by
-                # the true offsets, and the logits are unpadded before it runs.
-                labels = torch.nn.functional.pad(labels, (0, cp_pad_len), value=pad_id)
-                # Padding continues the last position rather than restarting at
-                # zero: a fresh zero would read as a new document to any
-                # position-derived mask.
+                # The positions: ulysses_pad numbers the padding from zero,
+                # which reads as the start of a new document to a mask built
+                # from positions -- this model's does. Renumber the padding to
+                # continue the stream instead.
+                continued = torch.arange(
+                    1, cp_pad_len + 1, device=position_ids.device
+                )
                 if position_ids.dim() == 3:
-                    tail = position_ids[..., -1:] + torch.arange(
-                        1, cp_pad_len + 1, device=position_ids.device
+                    position_ids[..., -cp_pad_len:] = (
+                        position_ids[..., -cp_pad_len - 1 : -cp_pad_len] + continued
                     )
-                    position_ids = torch.cat([position_ids, tail], dim=-1)
                 else:
-                    tail = position_ids[:, -1:] + torch.arange(
-                        1, cp_pad_len + 1, device=position_ids.device
+                    position_ids[:, -cp_pad_len:] = (
+                        position_ids[:, -cp_pad_len - 1 : -cp_pad_len] + continued
                     )
-                    position_ids = torch.cat([position_ids, tail], dim=1)
+                # Labels ride along so they stay aligned with the logits; both
+                # are unpadded before the loss (prepare_model_outputs).
+                labels = torch.nn.functional.pad(labels, (0, cp_pad_len), value=pad_id)
                 extra_inputs["positions"] = position_ids
                 if attention_mask is not None:
                     attention_mask = get_attention_masks(
