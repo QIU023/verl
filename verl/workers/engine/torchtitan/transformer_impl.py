@@ -1116,6 +1116,38 @@ def _merged_state_dict_if_lora(module):
     return merged, frozenset(k for k in merged if k not in raw)
 
 
+def _leave_iteration(parts, exc_type) -> None:
+    """Put the FSDP2 groups back to sharded before the parts are offloaded.
+
+    On a normal exit only reshard is needed. When an exception interrupted a
+    forward or backward, groups can be left mid-iteration (unsharded, FORWARD
+    state), where reshard() is a no-op and offload trips reset_sharded_param,
+    masking the real error; FSDP2's reset_iter_state is the sanctioned recovery.
+    """
+    if exc_type is None:
+        _reshard_all(parts)
+        return
+    from torch.distributed.fsdp import FSDPModule
+
+    for part in parts:
+        if isinstance(part, FSDPModule):
+            part.reset_iter_state()
+
+
+def _reshard_all(parts) -> None:
+    """Reshard every FSDP2 module in the model parts, not only the roots.
+
+    FSDPModule.reshard() covers the module's own parameter group; a stage whose
+    per-layer groups are still unsharded needs each of them resharded.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    for part in parts:
+        for module in part.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
+
+
 class EngineEvalModeCtx(BaseEngineCtx):
     def __init__(self, engine: TorchTitanEngine, **kwargs):
         super().__init__(engine=engine, mode="eval", **kwargs)
@@ -1135,9 +1167,7 @@ class EngineEvalModeCtx(BaseEngineCtx):
         # explicit reshard. Offloading in that state trips reset_sharded_param.
         # The wrap exists at any shard degree -- a pipeline stage on one rank is
         # still fully_shard'ed -- so reshard whenever the module can.
-        for module in self.engine.module:
-            if hasattr(module, "reshard"):
-                module.reshard()
+        _leave_iteration(self.engine.module, exc_type)
 
         super().__exit__(exc_type, exc_value, traceback)
 
@@ -1156,6 +1186,10 @@ class EngineTrainModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, TorchTitanEngine)
         if self.zero_grad_on_exit or exc_type is not None:
             self.engine.optimizer_zero_grad()
+        # Under pipeline parallelism the last stage leaves the train step with
+        # its per-layer FSDP groups unsharded (plain parameters); offloading in
+        # that state trips reset_sharded_param. reshard() is a no-op when sharded.
+        _leave_iteration(self.engine.module, exc_type)
         super().__exit__(exc_type, exc_value, traceback)
 
 
