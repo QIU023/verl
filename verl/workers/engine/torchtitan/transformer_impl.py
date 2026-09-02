@@ -125,8 +125,18 @@ class TorchTitanEngine(BaseEngine):
             model_spec = model_module.model_registry(
                 torchtitan_flavor, attn_backend=self.engine_config.attn_type
             )
-        except ValueError:
-            config_registry = getattr(model_module, "config_registry", None)
+        except (ValueError, KeyError):
+            # model_registry raises KeyError for a name its parser does not
+            # know and ValueError for one it parses but does not have; the
+            # config_registry functions are reached through either.
+            import importlib
+
+            try:
+                config_registry = importlib.import_module(
+                    f"{model_module.__name__}.config_registry"
+                )
+            except ImportError:
+                config_registry = None
             fn = getattr(config_registry, torchtitan_flavor, None) if config_registry else None
             if fn is None or not callable(fn):
                 raise
