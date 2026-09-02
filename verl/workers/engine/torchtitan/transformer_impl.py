@@ -93,6 +93,7 @@ class _PipelineLossBridge:
         self.micro_batches = {}
         self.output_args = {}
         self.outputs = {}
+        self.padding = set()
 
     def __call__(self, pred, target, **_):
         index = int(target.item()) if torch.is_tensor(target) else int(target)
@@ -111,6 +112,10 @@ class _PipelineLossBridge:
         else:
             loss = pred.new_zeros((), dtype=torch.float32)
             metrics = {}
+        if index in self.padding:
+            # A padding slot repeats a real micro-batch to fill the schedule's
+            # chunk; it contributes no gradient and no output.
+            return loss * 0.0
         self.outputs[index] = {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
         return loss
 
@@ -215,6 +220,9 @@ class TorchTitanEngine(BaseEngine):
             fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
             tensor_parallel_degree=self.engine_config.tensor_parallel_size,
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
+            # The engine feeds the schedule in chunks of this many verl micro-batches
+            # (torch requires at least one per stage), padding a short tail chunk.
+            num_pp_microbatches=max(1, self.engine_config.pipeline_parallel_size),
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             spmd_backend=self.engine_config.spmd_backend,
@@ -484,27 +492,25 @@ class TorchTitanEngine(BaseEngine):
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def _pp_forward_backward_batch(self, micro_batches, *, loss_function, forward_only):
-        """Run the pipeline schedule once per verl micro-batch.
+        """Drive the pipeline schedule over verl's micro-batches.
 
-        The schedule is built with one pipeline microbatch, so every verl
-        micro-batch is one schedule step: no fill/drain overlap, but the
-        numbers are the same for any micro-batch count, including dynamic
-        batch sizes. The last stage's outputs come back through the bridge;
-        the other stages return placeholders the worker never collects.
+        torch requires at least one pipeline microbatch per stage, so the
+        schedule is built with ``num_pp_microbatches = pipeline_parallel_size``
+        and the verl micro-batches are fed in chunks of that size; a short
+        tail chunk is padded by repeating its last micro-batch, and the bridge
+        zeroes the padding's loss so it adds no gradient and no output. The
+        last stage's outputs come back through the bridge, in order; the other
+        stages return placeholders the worker never collects.
         """
         trainer = self.trainer
         schedule = trainer.pp_schedule
-        if schedule._n_microbatches != 1:
-            raise ValueError(
-                "the verl torchtitan engine drives the pipeline one micro-batch per step; "
-                f"parallelism.num_pp_microbatches must be 1, got {schedule._n_microbatches}"
-            )
+        chunk = schedule._n_microbatches
         bridge = self._pp_bridge
         bridge.reset(loss_function)
         device_name = get_device_name()
         first, last = trainer.pp_has_first_stage, trainer.pp_has_last_stage
         folded = getattr(self.module[0], "folded_token_stream", False)
-        output_lst = []
+        prepared = []
         for index, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
@@ -516,27 +522,39 @@ class TorchTitanEngine(BaseEngine):
                 }
             bridge.micro_batches[index] = micro_batch
             bridge.output_args[index] = output_args
-            kwargs = {**extra_inputs, **extra_kwargs}
-            target = torch.tensor(index, device=get_device_id())
+            prepared.append((index, input_ids, {**extra_inputs, **extra_kwargs}))
+        for start in range(0, len(prepared), chunk):
+            group = prepared[start : start + chunk]
+            slots = list(group)
+            while len(slots) < chunk:
+                # Pad with a copy of the last real micro-batch under a fresh index.
+                pad_index = len(prepared) + len(bridge.padding)
+                real_index, input_ids, kwargs = group[-1]
+                bridge.micro_batches[pad_index] = bridge.micro_batches[real_index]
+                bridge.output_args[pad_index] = bridge.output_args[real_index]
+                bridge.padding.add(pad_index)
+                slots.append((pad_index, input_ids, kwargs))
+            arg_mbs = [(input_ids,) for _, input_ids, _ in slots]
+            kwarg_mbs = [kwargs for _, _, kwargs in slots]
+            target_mbs = [torch.tensor(index, device=get_device_id()) for index, _, _ in slots]
             losses = [] if last else None
             with trainer.train_context(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
                 if forward_only:
                     schedule.eval(
-                        arg_mbs=[(input_ids,)] if first else None,
-                        kwarg_mbs=[kwargs],
-                        target_mbs=[target] if last else None,
+                        arg_mbs=arg_mbs if first else None,
+                        kwarg_mbs=kwarg_mbs,
+                        target_mbs=target_mbs if last else None,
                         losses=losses,
                     )
                 else:
                     schedule.step(
-                        arg_mbs=[(input_ids,)] if first else None,
-                        kwarg_mbs=[kwargs],
-                        target_mbs=[target] if last else None,
+                        arg_mbs=arg_mbs if first else None,
+                        kwarg_mbs=kwarg_mbs,
+                        target_mbs=target_mbs if last else None,
                         losses=losses,
                         return_outputs=False,
                     )
-            output_lst.append(bridge.outputs.get(index, {"loss": 0.0, "metrics": {}}))
-        return output_lst
+        return [bridge.outputs.get(index, {"loss": 0.0, "metrics": {}}) for index in range(len(micro_batches))]
 
     def model_forward_step(
         self,
