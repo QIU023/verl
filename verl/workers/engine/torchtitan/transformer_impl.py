@@ -512,43 +512,9 @@ class TorchTitanEngine(BaseEngine):
         first, last = trainer.pp_has_first_stage, trainer.pp_has_last_stage
         folded = getattr(self.module[0], "folded_token_stream", False)
         prepared = []
-        # Pipeline stages size their P2P buffers once, from the first
-        # microbatch, so every microbatch must carry the same token count:
-        # pad each one to a fixed budget (positions continue the stream, the
-        # mask is rebuilt, the logits are cut back before the loss).
-        budget = int(os.environ.get("VERL_PP_TOKEN_BUDGET", "0"))
-        if budget <= 0:
-            raise ValueError(
-                "pipeline parallelism needs a fixed token count per micro-batch; "
-                "set VERL_PP_TOKEN_BUDGET to at least the largest packed micro-batch"
-            )
         for index, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
-            tokens = input_ids.shape[-1]
-            if tokens > budget:
-                raise ValueError(
-                    f"micro-batch of {tokens} tokens exceeds VERL_PP_TOKEN_BUDGET={budget}; "
-                    "raise the budget or lower the micro-batch size"
-                )
-            pp_pad_len = budget - tokens
-            if pp_pad_len:
-                pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
-                input_ids = torch.nn.functional.pad(input_ids, (0, pp_pad_len), value=pad_id)
-                position_ids = extra_inputs["positions"]
-                continued = torch.arange(1, pp_pad_len + 1, device=position_ids.device)
-                last = position_ids[..., -1:]
-                position_ids = torch.cat((position_ids, last + continued), dim=-1)
-                extra_inputs["positions"] = position_ids
-                if extra_kwargs.get("attention_masks") is not None:
-                    extra_kwargs["attention_masks"] = get_attention_masks(
-                        input_batch=input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0),
-                        positions=position_ids,
-                        attn_type=self.engine_config.attn_type,
-                    )
-                if "positions" in extra_kwargs:
-                    extra_kwargs["positions"] = position_ids
-                output_args["pp_pad_len"] = pp_pad_len
             if folded and input_ids.dim() == 2 and input_ids.shape[0] == 1:
                 input_ids = input_ids.squeeze(0)
                 extra_inputs = {
@@ -1248,6 +1214,39 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
         cp_pad_len = 0
+        if self.parallel_dims.pp_enabled:
+            # Pipeline stages size their P2P buffers once, from the first
+            # microbatch, so every microbatch must carry the same token
+            # count. Pad the packed stream to a fixed budget before any CP
+            # split: positions continue the stream, the mask is rebuilt, and
+            # the bridge cuts the logits back before the loss.
+            budget = int(os.environ.get("VERL_PP_TOKEN_BUDGET", "0"))
+            if budget <= 0:
+                raise ValueError(
+                    "pipeline parallelism needs a fixed token count per micro-batch; "
+                    "set VERL_PP_TOKEN_BUDGET to at least the largest packed micro-batch"
+                )
+            tokens = input_ids.shape[-1]
+            if tokens > budget:
+                raise ValueError(
+                    f"micro-batch of {tokens} tokens exceeds VERL_PP_TOKEN_BUDGET={budget}; "
+                    "raise the budget or lower the micro-batch size"
+                )
+            pp_pad_len = budget - tokens
+            if pp_pad_len:
+                pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+                input_ids = torch.nn.functional.pad(input_ids, (0, pp_pad_len), value=pad_id)
+                continued = torch.arange(1, pp_pad_len + 1, device=position_ids.device)
+                position_ids = torch.cat((position_ids, position_ids[..., -1:] + continued), dim=-1)
+                extra_inputs["positions"] = position_ids
+                if attention_mask is not None:
+                    attention_mask = get_attention_masks(
+                        input_batch=input_ids,
+                        positions=position_ids,
+                        attn_type=self.engine_config.attn_type,
+                    )
+                    extra_kwargs["attention_masks"] = attention_mask
+            output_args["pp_pad_len"] = pp_pad_len
         if self.parallel_dims.cp_enabled:
             # Context parallel wants a sequence it can cut evenly, and the flex
             # BlockMask wants each shard to be a whole number of 128-token
