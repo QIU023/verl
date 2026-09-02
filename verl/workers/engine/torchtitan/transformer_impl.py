@@ -98,9 +98,11 @@ class _PipelineLossBridge:
     def __call__(self, pred, target, **_):
         index = int(target.item()) if torch.is_tensor(target) else int(target)
         engine = self.engine
-        pred = engine._finish_pred(pred)
         if pred.dim() == 2:
+            # The folded stream comes back as [T, V]; the CP gather in
+            # _finish_pred works on the token axis of [1, T, V].
             pred = pred.unsqueeze(0)
+        pred = engine._finish_pred(pred)
         pp_pad_len = self.output_args[index].get("pp_pad_len", 0)
         if pp_pad_len:
             pred = pred[:, :-pp_pad_len]
