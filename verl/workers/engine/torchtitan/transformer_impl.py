@@ -431,27 +431,25 @@ class TorchTitanEngine(BaseEngine):
         raise NotImplementedError
 
     def _get_data_parallel_mesh(self):
-        """Get the DATA-loading parallel mesh (excludes cp).
+        """The mesh verl treats as data parallel.
 
         torchtitan's "fsdp" mesh is dp_shard x cp -- FSDP folds cp into its
-        gradient-reduction axis -- so under cp > 1 it is NOT the dataloader
-        axis: all cp ranks of one dp group must receive the SAME batch (the
-        trainer seq-shards it across cp afterwards). "batch" is
-        dp_replicate x dp_shard, exactly the sampler axis; using "fsdp"
-        here made rank cp_i draw sample shard i and crash the
-        DistributedSampler (rank >= num_replicas) at dp_shard=1, cp=2.
+        shard axis -- and it only exists when that product is > 1. What verl
+        needs is the sampler axis, dp_replicate x dp_shard; "fsdp" is used
+        because under cp > 1 with no real dp the correct answer is still
+        "one replica" and the fsdp mesh carries that. When neither axis is
+        enabled (pp or tp alone) there is no data-parallel mesh at all.
         """
-        mesh = self.parallel_dims.get_optional_mesh("batch")
-        if mesh is None and self.parallel_dims.cp == 1:
-            # Legacy fallbacks; only valid when cp == 1 (then fsdp ==
-            # dp_shard). Under cp > 1 with no real dp, the correct answer
-            # is None (single dp replica, rank 0).
-            mesh = self.parallel_dims.get_optional_mesh(["dp_replicate", "fsdp"])
-            if mesh is None:
-                mesh = self.parallel_dims.get_optional_mesh("fsdp")
-            if mesh is None:
-                mesh = self.parallel_dims.get_optional_mesh("dp_replicate")
-        return mesh
+        parallel_dims = self.parallel_dims
+        candidates = (["dp_replicate", "fsdp"], "fsdp", ["dp_replicate", "dp_shard"], "dp_shard", "dp")
+        for names in candidates:
+            try:
+                mesh = parallel_dims.get_optional_mesh(names)
+            except ValueError:
+                continue
+            if mesh is not None:
+                return mesh
+        return None
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
