@@ -1130,8 +1130,13 @@ class EngineEvalModeCtx(BaseEngineCtx):
         assert isinstance(self.engine, TorchTitanEngine)
 
         # Reshard the root FSDP module
-        if self.engine.engine_config.data_parallel_shard_size > 1:
-            for module in self.engine.module:
+        # A forward-only pass leaves FSDP2's root unsharded: its parameters are
+        # the plain unsharded tensors until a backward (which never comes) or an
+        # explicit reshard. Offloading in that state trips reset_sharded_param.
+        # The wrap exists at any shard degree -- a pipeline stage on one rank is
+        # still fully_shard'ed -- so reshard whenever the module can.
+        for module in self.engine.module:
+            if hasattr(module, "reshard"):
                 module.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
