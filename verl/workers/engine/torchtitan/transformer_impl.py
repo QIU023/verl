@@ -73,6 +73,48 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+class _PipelineLossBridge:
+    """The loss the pipeline schedule calls on the last stage.
+
+    torchtitan builds its schedule with a loss at construction; verl hands a
+    loss function to every forward_backward_batch call. The bridge is
+    installed as the schedule's loss once and re-targeted per call: the
+    target the schedule passes is the micro-batch index, and the bridge runs
+    verl's output preparation and loss on that micro-batch, keeping the
+    outputs the worker collects from the last stage.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.reset(None)
+
+    def reset(self, loss_function):
+        self.loss_function = loss_function
+        self.micro_batches = {}
+        self.output_args = {}
+        self.outputs = {}
+
+    def __call__(self, pred, target, **_):
+        index = int(target.item()) if torch.is_tensor(target) else int(target)
+        engine = self.engine
+        pred = engine._finish_pred(pred)
+        if pred.dim() == 2:
+            pred = pred.unsqueeze(0)
+        micro_batch = self.micro_batches[index]
+        model_output = engine.prepare_model_outputs(
+            logits=pred, output_args=self.output_args[index], micro_batch=micro_batch
+        )
+        if self.loss_function is not None:
+            loss, metrics = self.loss_function(
+                model_output=model_output, data=micro_batch, dp_group=engine.get_data_parallel_group()
+            )
+        else:
+            loss = pred.new_zeros((), dtype=torch.float32)
+            metrics = {}
+        self.outputs[index] = {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
+        return loss
+
+
 class TorchTitanEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch TorchTitan parallelism.
@@ -303,6 +345,11 @@ class TorchTitanEngine(BaseEngine):
         Sets up checkpoint manager.
         """
         self.module = self.trainer.model_parts
+        if self.parallel_dims.pp_enabled:
+            # torchtitan's schedule owns the loss; hand it the bridge so verl's
+            # per-call loss function reaches the last stage.
+            self._pp_bridge = _PipelineLossBridge(self)
+            self.trainer.pp_schedule._loss_fn = self._pp_bridge
         self.checkpointer = self.trainer.checkpointer
         # load initial HF weights
         self.checkpointer.load()
@@ -416,6 +463,11 @@ class TorchTitanEngine(BaseEngine):
             same_micro_num_in_dp=True,
         )
 
+        if self.parallel_dims.pp_enabled:
+            output_lst = self._pp_forward_backward_batch(
+                micro_batches, loss_function=loss_function, forward_only=forward_only
+            )
+            return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -430,6 +482,61 @@ class TorchTitanEngine(BaseEngine):
             output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _pp_forward_backward_batch(self, micro_batches, *, loss_function, forward_only):
+        """Run the pipeline schedule once per verl micro-batch.
+
+        The schedule is built with one pipeline microbatch, so every verl
+        micro-batch is one schedule step: no fill/drain overlap, but the
+        numbers are the same for any micro-batch count, including dynamic
+        batch sizes. The last stage's outputs come back through the bridge;
+        the other stages return placeholders the worker never collects.
+        """
+        trainer = self.trainer
+        schedule = trainer.pp_schedule
+        if schedule._n_microbatches != 1:
+            raise ValueError(
+                "the verl torchtitan engine drives the pipeline one micro-batch per step; "
+                f"parallelism.num_pp_microbatches must be 1, got {schedule._n_microbatches}"
+            )
+        bridge = self._pp_bridge
+        bridge.reset(loss_function)
+        device_name = get_device_name()
+        first, last = trainer.pp_has_first_stage, trainer.pp_has_last_stage
+        folded = getattr(self.module[0], "folded_token_stream", False)
+        output_lst = []
+        for index, micro_batch in enumerate(micro_batches):
+            micro_batch = micro_batch.to(get_device_id())
+            input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+            if folded and input_ids.dim() == 2 and input_ids.shape[0] == 1:
+                input_ids = input_ids.squeeze(0)
+                extra_inputs = {
+                    k: (v.squeeze(0) if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == 1 else v)
+                    for k, v in extra_inputs.items()
+                }
+            bridge.micro_batches[index] = micro_batch
+            bridge.output_args[index] = output_args
+            kwargs = {**extra_inputs, **extra_kwargs}
+            target = torch.tensor(index, device=get_device_id())
+            losses = [] if last else None
+            with trainer.train_context(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+                if forward_only:
+                    schedule.eval(
+                        arg_mbs=[(input_ids,)] if first else None,
+                        kwarg_mbs=[kwargs],
+                        target_mbs=[target] if last else None,
+                        losses=losses,
+                    )
+                else:
+                    schedule.step(
+                        arg_mbs=[(input_ids,)] if first else None,
+                        kwarg_mbs=[kwargs],
+                        target_mbs=[target] if last else None,
+                        losses=losses,
+                        return_outputs=False,
+                    )
+            output_lst.append(bridge.outputs.get(index, {"loss": 0.0, "metrics": {}}))
+        return output_lst
 
     def model_forward_step(
         self,
@@ -467,6 +574,11 @@ class TorchTitanEngine(BaseEngine):
             else:
                 pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
+        return self._finish_pred(pred)
+
+    def _finish_pred(self, pred: torch.Tensor) -> torch.Tensor:
+        """Bring a stage's logits to the layout the loss side expects."""
+        parallel_dims = self.parallel_dims
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
         if parallel_dims.cp_enabled:
