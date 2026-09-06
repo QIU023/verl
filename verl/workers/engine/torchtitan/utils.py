@@ -50,8 +50,6 @@ class NoOpDataLoader(BaseDataLoader):
         # packing by inspecting it); verl feeds the data itself, so there is none.
         dataset: Any = None
 
-        pass
-
     def __init__(self, **kwargs):
         pass
 
