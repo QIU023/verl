@@ -59,7 +59,7 @@ def _helper():
 def _lora_model():
     from torchtitan.models.kimi_k3 import config_registry as cr
 
-    model = cr.kimi_k3_debugmodel_gated_lora().model_spec.model.build()
+    model = cr.kimi_k3_debugmodel_lora().model_spec.model.build()
     model.init_weights()
     return model
 
@@ -69,7 +69,12 @@ class TestMergedWeightSync:
         merged, merged_keys = _helper()(_lora_model())
         assert not [k for k in merged if "lora" in k or ".base." in k]
         assert merged_keys, "the merge must report which keys it produced"
-        assert "layers.0.ffn.gate_proj.weight" in merged
+        # a LoRA target's base key, under the new tree's names (feed-forward w1 or the
+        # latent MoE's routed_up, whichever layer 0 carries)
+        assert any(
+            k.endswith((".feed_forward.w1.weight", ".moe.routed_up.weight"))
+            for k in merged
+        ), sorted(merged)[:5]
 
     def test_the_merged_output_tracks_the_adapter(self):
         """The differential that separates this from the raw path.
@@ -80,23 +85,29 @@ class TestMergedWeightSync:
         """
         model = _lora_model()
         helper = _helper()
-        key = "layers.0.ffn.gate_proj.weight"
-        before = helper(model)[0][key].clone()
-        raw_before = model.state_dict()["layers.0.ffn.gate_proj.base.weight"].clone()
+        merged_before, _ = helper(model)
+        # a LoRA target's base key; core's merge keeps the base key's own name
+        key = next(
+            k
+            for k in merged_before
+            if k.endswith((".feed_forward.w1.weight", ".moe.routed_up.weight"))
+        )
+        before = merged_before[key].clone()
+        raw_before = model.state_dict()[key].clone()
 
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if name.endswith("lora_b"):
+                if name.endswith(("lora_b", "lora_b.weight")):
                     param.fill_(0.01)
 
         assert not torch.equal(helper(model)[0][key], before)
-        raw_after = model.state_dict()["layers.0.ffn.gate_proj.base.weight"]
+        raw_after = model.state_dict()[key]
         assert torch.equal(raw_after, raw_before)
 
     def test_a_model_without_lora_is_untouched(self):
         from torchtitan.models.kimi_k3 import config_registry as cr
 
-        model = cr.kimi_k3_debugmodel_report_arch().model_spec.model.build()
+        model = cr.kimi_k3_debugmodel().model_spec.model.build()
         plain, merged_keys = _helper()(model)
         assert set(plain) == set(model.state_dict())
         assert merged_keys == frozenset()

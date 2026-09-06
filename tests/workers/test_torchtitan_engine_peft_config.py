@@ -45,13 +45,18 @@ import torch.nn as nn  # noqa: E402
 
 
 class _Wrapper(nn.Module):
-    """Stands in for KimiLoRALinear: the engine detects the trio by attribute."""
+    """Stands in for torchtitan core's LoRA linear: the base ``weight`` on the module,
+    ``lora_a`` / ``lora_b`` as Linear submodules, ``_lora_scaling`` = alpha / rank.
+    The engine detects it as it detects the earlier wrapper (``base`` submodule,
+    adapter parameters): by the trio of attributes."""
 
     def __init__(self, in_features: int, out_features: int, rank: int, alpha: float):
         super().__init__()
-        self.base = nn.Linear(in_features, out_features, bias=False)
-        self.lora_a = nn.Parameter(torch.randn(rank, in_features))
-        self.lora_b = nn.Parameter(torch.zeros(out_features, rank))
+        self.weight = nn.Parameter(torch.zeros(out_features, in_features))
+        self.base = self  # the attribute trio the engine looks for
+        self.lora_a = nn.Linear(in_features, rank, bias=False)
+        self.lora_b = nn.Linear(rank, out_features, bias=False)
+        nn.init.zeros_(self.lora_b.weight)
         self._lora_scaling = alpha / rank
 
 
@@ -82,9 +87,9 @@ def _sd(*fqns, wrapper: str | None = None):
     """
     out = {}
     for fqn in fqns:
-        out[f"{fqn}.base.weight"] = torch.zeros(1)
-        out[f"{fqn}.lora_a"] = torch.zeros(1)
-        out[f"{fqn}.lora_b"] = torch.zeros(1)
+        out[f"{fqn}.weight"] = torch.zeros(1)
+        out[f"{fqn}.lora_a.weight"] = torch.zeros(1)
+        out[f"{fqn}.lora_b.weight"] = torch.zeros(1)
     _ = wrapper
     return out
 
@@ -137,7 +142,7 @@ class TestTitanPeftConfig(unittest.TestCase):
         find, _, names, adapters, _ = _helpers()
         model = _Model(rank=8, alpha=16.0)
         with torch.no_grad():
-            model.q_proj.lora_b.fill_(0.5)
+            model.q_proj.lora_b.weight.fill_(0.5)
         wrappers = find(model)
         hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
         out = adapters(wrappers, hf)
