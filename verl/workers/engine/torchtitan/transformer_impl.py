@@ -186,6 +186,9 @@ class TorchTitanEngine(BaseEngine):
         # kimi_k3 handles CP module-internally (Ulysses) and is causal-only:
         # no attention_masks consumed, no upstream CP mask sharding needed.
         self._model_cp_is_module_internal = torchtitan_name == "kimi_k3"
+        # Kimi K3 takes a folded [T] token stream (the model declared it on the earlier
+        # tree; on torchtitan main it is a property of the architecture, not an attribute).
+        self._folded_token_stream = torchtitan_name == "kimi_k3"
 
         # Get ModelSpec from model registry
         from .utils import _import_torchtitan_model_module
@@ -537,7 +540,7 @@ class TorchTitanEngine(BaseEngine):
         bridge.reset(loss_function)
         device_name = get_device_name()
         first, last = trainer.pp_has_first_stage, trainer.pp_has_last_stage
-        folded = getattr(self.module[0], "folded_token_stream", False)
+        folded = getattr(self.module[0], "folded_token_stream", False) or self._folded_token_stream
         prepared = []
         for index, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
@@ -605,7 +608,7 @@ class TorchTitanEngine(BaseEngine):
         else:
             # Non-PP forward. train_context (SPMD mesh) is set by the caller.
             assert len(model_parts) == 1
-            folded = getattr(model_parts[0], "folded_token_stream", False)
+            folded = getattr(model_parts[0], "folded_token_stream", False) or self._folded_token_stream
             if folded and inputs.dim() == 2 and inputs.shape[0] == 1:
                 # Folded-stream models (kimi_k3) take [T] token streams; the
                 # rmpad path packs to [1, T]. Fold in, unfold the logits out.
@@ -718,6 +721,18 @@ class TorchTitanEngine(BaseEngine):
         torch.distributed.barrier()
         if self._is_offload_param:
             for module in self.module:
+                # FSDP2's reset_sharded_param (inside model.to) assumes every managed
+                # parameter is a DTensor; a plain one fails the offload with
+                # "'Parameter' object has no attribute '_local_tensor'". Name them
+                # before that happens, once, so the report points at the parameter.
+                if not getattr(self, "_plain_params_reported", False):
+                    self._plain_params_reported = True
+                    plain = [n for n, p in module.named_parameters() if not isinstance(p, DTensor)]
+                    if plain:
+                        logger.warning(
+                            "offload: %d parameter(s) are not DTensors and FSDP2 will refuse "
+                            "to move them; first few: %s", len(plain), plain[:8]
+                        )
                 offload_fsdp_model_to_cpu(module)
 
     def load_checkpoint(
