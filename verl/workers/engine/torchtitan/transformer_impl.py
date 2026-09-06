@@ -17,6 +17,7 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 
 import gc
 import importlib
+import inspect
 import logging
 import os
 import re
@@ -35,6 +36,12 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+
+# torchtitan's CP input API changed shape: the current one takes the named inputs as a dict
+# and shards each along its declared sequence axis in place; the earlier one took
+# (inputs, labels, extra_kwargs, ...) positionally. Both are still met by trees this engine
+# runs on, so the call site below picks by signature.
+_CP_INPUT_DICT_API = "input_dict" in inspect.signature(prepare_context_parallel_input).parameters
 
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -537,6 +544,7 @@ class TorchTitanEngine(BaseEngine):
         schedule = trainer.pp_schedule
         chunk = schedule._n_microbatches
         bridge = self._pp_bridge
+        _guard_fsdp_grad_upcast()
         bridge.reset(loss_function)
         device_name = get_device_name()
         first, last = trainer.pp_has_first_stage, trainer.pp_has_last_stage
@@ -1056,6 +1064,43 @@ class TorchTitanEngine(BaseEngine):
         return per_tensor_param, peft_config
 
 
+_FSDP_GRAD_UPCAST_GUARDED = False
+
+
+def _guard_fsdp_grad_upcast() -> None:
+    """Skip FSDP2's gradient upcast for a parameter that was never all-gathered.
+
+    Under a pipeline schedule the non-last micro-batches run FSDP2's post_backward with
+    grad reduction off; that path upcasts each parameter's unsharded gradient and reads
+    ``_unsharded_param`` without the ``hasattr`` guard its reduce path has, so a
+    parameter group whose forward never ran on this rank (a module the batch does not
+    reach) raises AttributeError. Mirror the guard, and name the parameter once.
+    """
+    global _FSDP_GRAD_UPCAST_GUARDED
+    if _FSDP_GRAD_UPCAST_GUARDED:
+        return
+    _FSDP_GRAD_UPCAST_GUARDED = True
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+
+    original = FSDPParam.to_accumulated_grad_if_needed
+    reported: set[str] = set()
+
+    def guarded(self):
+        if not hasattr(self, "_unsharded_param"):
+            fqn = getattr(self, "_param_fqn", None) or getattr(self, "fqn", "?")
+            if fqn not in reported:
+                reported.add(fqn)
+                logger.warning(
+                    "FSDP2 post_backward for %s without an all-gather on this rank: "
+                    "skipping its gradient upcast",
+                    fqn,
+                )
+            return
+        return original(self)
+
+    FSDPParam.to_accumulated_grad_if_needed = guarded
+
+
 def _titan_lora_wrappers(module):
     """``{fqn: wrapper}`` for every KimiLoRALinear in the module.
 
@@ -1495,17 +1540,35 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     positions.squeeze(0) if positions.dim() > 1 and positions.shape[0] == 1
                     else positions
                 )
-            input_ids, _labels_sharded, extra_kwargs = prepare_context_parallel_input(
-                input_ids,
-                labels,
-                extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
-                self.trainer.device,
-                # NO_PADDING packs variable-length sequences, so the
-                # head-tail balancer's seq % (2*cp) == 0 precondition cannot
-                # hold; shard contiguously.
-                None,
-            )
+            if _CP_INPUT_DICT_API:
+                # Labels stay out of the dict and full length (see above); the
+                # masks stay whole too -- the kernels this path serves declare
+                # shard_attention_mask False (a global mask per rank).
+                sharded = prepare_context_parallel_input(
+                    {"input": input_ids, "positions": extra_kwargs["positions"]},
+                    None,
+                    self.parallel_dims.get_mesh("cp"),
+                    # NO_PADDING packs variable-length sequences, so the
+                    # head-tail balancer's seq % (2*cp) == 0 precondition cannot
+                    # hold; shard contiguously.
+                    None,
+                    None,
+                    shard_attention_mask=False,
+                )
+                input_ids = sharded["input"]
+                extra_kwargs["positions"] = sharded["positions"]
+            else:
+                input_ids, _labels_sharded, extra_kwargs = prepare_context_parallel_input(
+                    input_ids,
+                    labels,
+                    extra_kwargs,
+                    self.parallel_dims.get_mesh("cp"),
+                    self.trainer.device,
+                    # NO_PADDING packs variable-length sequences, so the
+                    # head-tail balancer's seq % (2*cp) == 0 precondition cannot
+                    # hold; shard contiguously.
+                    None,
+                )
             labels = labels_full
             extra_inputs["positions"] = extra_kwargs.pop("positions")
             if folded_for_cp:
