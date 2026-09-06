@@ -46,6 +46,10 @@ class NoOpDataLoader(BaseDataLoader):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
+        # Model configs may read the dataloader's dataset (Kimi K3 refuses sample
+        # packing by inspecting it); verl feeds the data itself, so there is none.
+        dataset: Any = None
+
         pass
 
     def __init__(self, **kwargs):
