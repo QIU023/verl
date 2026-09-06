@@ -23,9 +23,10 @@ bought no sync bandwidth at all. These pin the three things that decision rests 
   target-module names that were actually wrapped;
 * the adapter half emits PEFT's ``lora_A`` / ``lora_B`` names and the raw, UNSCALED
   factors, because PEFT re-applies ``lora_alpha / r`` from the config;
-* the base half is the FULL model with ``base_layer`` inserted only on wrapped
-  projections -- shipping just the wrapped bases would leave the rollout without
-  embeddings, norms or experts.
+* the base half is the FULL model under its plain HF names -- the vLLM receiver
+  (``resolve_weight_name``) toggles ``.base_layer`` per name against its live
+  namespace, so the trainer renames nothing; a wrapped projection whose base key
+  is absent is named in a warning, never invented.
 
 CPU only: these exercise the naming and config helpers directly, with no process group,
 no GPU and no rollout engine.
@@ -94,12 +95,18 @@ def _sd(*fqns, wrapper: str | None = None):
     return out
 
 
+def _engine_logger():
+    from verl.workers.engine.torchtitan import transformer_impl
+
+    return transformer_impl.logger
+
+
 def _helpers():
     from verl.workers.engine.torchtitan.transformer_impl import (
         _adapter_state_dict,
-        _insert_base_layer_suffix,
         _peft_config_from_wrappers,
         _titan_lora_wrappers,
+        _warn_wrapped_bases_missing,
         _wrapped_hf_base_names,
     )
 
@@ -108,7 +115,7 @@ def _helpers():
         _peft_config_from_wrappers,
         _wrapped_hf_base_names,
         _adapter_state_dict,
-        _insert_base_layer_suffix,
+        _warn_wrapped_bases_missing,
     )
 
 
@@ -163,8 +170,9 @@ class TestTitanPeftConfig(unittest.TestCase):
         self.assertEqual(out["model.q_proj.lora_A.weight"].shape, (8, 4))
         self.assertEqual(out["model.q_proj.lora_B.weight"].shape, (4, 8))
 
-    def test_base_half_keeps_everything_and_renames_only_the_wrapped(self):
-        find, _, names, _, insert = _helpers()
+    def test_base_half_ships_plain_hf_names(self):
+        """No ``.base_layer`` from the trainer: the receiver resolves it per name."""
+        find, _, names, _, warn = _helpers()
         wrappers = find(_Model())
         hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
         params = {
@@ -173,14 +181,15 @@ class TestTitanPeftConfig(unittest.TestCase):
             "model.norm.weight": torch.zeros(1),
             "model.embed_tokens.weight": torch.zeros(1),
         }
-        out = insert(params, hf)
+        with self.assertNoLogs(_engine_logger(), level="WARNING"):
+            warn(params, hf)
         self.assertEqual(
-            sorted(out),
+            sorted(params),
             [
                 "model.embed_tokens.weight",
                 "model.norm.weight",
-                "model.o_proj.base_layer.weight",
-                "model.q_proj.base_layer.weight",
+                "model.o_proj.weight",
+                "model.q_proj.weight",
             ],
         )
 
@@ -193,11 +202,45 @@ class TestTitanPeftConfig(unittest.TestCase):
         names instead. The silent version of this is what produced a KeyError from deep
         inside vLLM's loader, with no indication of which projection disagreed.
         """
-        find, _, names, _, insert = _helpers()
+        find, _, names, _, warn = _helpers()
         wrappers = find(_Model())
         hf = names(_FakeAdapter(), wrappers, _sd(*wrappers))
-        out = insert({"model.q_proj.weight": torch.zeros(1)}, hf)
-        self.assertEqual(sorted(out), ["model.q_proj.base_layer.weight"])
+        params = {"model.q_proj.weight": torch.zeros(1)}
+        with self.assertLogs(_engine_logger(), level="WARNING") as logs:
+            warn(params, hf)
+        self.assertEqual(sorted(params), ["model.q_proj.weight"])
+        self.assertIn("o_proj", "\n".join(logs.output))
+
+
+class TestShardExportLoraMode(unittest.TestCase):
+    """The sharded delta export folds adapters into the bases and refuses adapter mode."""
+
+    def _engine(self, lora_cfg):
+        import types
+
+        from verl.workers.engine.torchtitan.transformer_impl import TorchTitanEngine
+
+        fake = types.SimpleNamespace(
+            module=[_Model()],
+            model_config=types.SimpleNamespace(lora=lora_cfg),
+            parallel_dims=types.SimpleNamespace(pp_enabled=False),
+        )
+        # the two engine methods the shard path calls before it touches a device
+        fake._assert_shard_export_supported = lambda: None
+        fake._lora_mode = lambda: TorchTitanEngine._lora_mode(fake)
+        return TorchTitanEngine, fake
+
+    def test_an_unconfigured_lora_block_means_merged(self):
+        engine, fake = self._engine({})
+        wrappers, adapter_mode = engine._lora_mode(fake)
+        self.assertEqual(sorted(wrappers), ["o_proj", "q_proj"])
+        self.assertFalse(adapter_mode)
+
+    def test_adapter_mode_is_refused_on_the_shard_path(self):
+        engine, fake = self._engine({"merge": False})
+        self.assertTrue(engine._lora_mode(fake)[1])
+        with self.assertRaises(NotImplementedError):
+            engine.get_per_tensor_param_shard(fake)
 
     def test_scaling_round_trip_matches_the_wrapper_math(self):
         """alpha recovered from the wrapper must reproduce its own scaling."""

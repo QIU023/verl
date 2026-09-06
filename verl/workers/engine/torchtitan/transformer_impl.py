@@ -828,9 +828,19 @@ class TorchTitanEngine(BaseEngine):
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield this rank's *local* shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of the full tensor."""
         self._assert_shard_export_supported()
+        _, adapter_mode = self._lora_mode()
+        if adapter_mode:
+            raise NotImplementedError(
+                "the torchtitan sharded delta export ships merged weights only; the adapter-only "
+                "sequence (model.lora.merge=False) has no delta protocol. Set model.lora.merge=True "
+                "or use the full-tensor sync."
+            )
         raw = {}
         for module in self.module:
-            raw.update(module.state_dict())
+            # Under LoRA the adapters fold into the bases first: a raw state_dict would ship the
+            # frozen base and hand to_hf the adapter keys it has no mapping for.
+            module_params, _ = _merged_state_dict_if_lora(module)
+            raw.update(module_params)
 
         # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
         stacks = {}
@@ -862,6 +872,24 @@ class TorchTitanEngine(BaseEngine):
 
         return _gen(), None
 
+    def _lora_mode(self) -> tuple[dict, bool]:
+        """The LoRA wrappers this engine holds, and whether the sync ships adapters unmerged.
+
+        Adapter mode is OPT-IN. model_config.lora defaults to an EMPTY dict, so reading merge
+        off it with a False default would flip every existing LoRA run onto that path -- and
+        the merged path is the one with end-to-end evidence. An empty (or absent) lora block
+        means the run said nothing about PEFT, so it stays merged; a configured block honours
+        its own merge flag, defaulting to False the way the megatron engine does.
+        """
+        wrappers = {}
+        for module in self.module:
+            wrappers.update(_titan_lora_wrappers(module))
+        lora_cfg = getattr(self.model_config, "lora", None)
+        if not isinstance(lora_cfg, dict):
+            lora_cfg = {} if lora_cfg is None else dict(vars(lora_cfg))
+        peft_merge = bool(lora_cfg.get("merge", False)) if lora_cfg else True
+        return wrappers, bool(wrappers) and not peft_merge
+
     def get_per_tensor_param(self, base_sync_done: bool = False, **kwargs):
         for module in self.module:
             load_fsdp_model_to_gpu(module)
@@ -871,20 +899,7 @@ class TorchTitanEngine(BaseEngine):
         # present, so returning None forced every LoRA run through a merged full-weight
         # sync even when it asked for model.lora.merge=False -- LoRA then bought
         # optimizer and gradient memory but none of its sync bandwidth.
-        wrappers = {}
-        for module in self.module:
-            wrappers.update(_titan_lora_wrappers(module))
-        # Adapter mode is OPT-IN. model_config.lora defaults to an EMPTY dict, so
-        # reading merge off it with a False default would flip every existing LoRA run
-        # onto this path -- and the merged path is the one with end-to-end evidence.
-        # An empty (or absent) lora block means the run said nothing about PEFT, so it
-        # stays merged; a configured block honours its own merge flag, defaulting to
-        # False the way the megatron engine does.
-        lora_cfg = getattr(self.model_config, "lora", None)
-        if not isinstance(lora_cfg, dict):
-            lora_cfg = {} if lora_cfg is None else dict(vars(lora_cfg))
-        peft_merge = bool(lora_cfg.get("merge", False)) if lora_cfg else True
-        adapter_mode = bool(wrappers) and not peft_merge
+        wrappers, adapter_mode = self._lora_mode()
         peft_config = _peft_config_from_wrappers(wrappers) if adapter_mode else None
 
         params = {}
@@ -991,7 +1006,10 @@ class TorchTitanEngine(BaseEngine):
                 # Second half of the sequence: only what LoRA learned goes over.
                 params = _adapter_state_dict(wrappers, hf_names)
             else:
-                params = _insert_base_layer_suffix(params, hf_names)
+                # The base half ships the FULL model under its plain HF names: the vLLM
+                # receiver (verl.utils.vllm.resolve_weight_name) toggles ``.base_layer``
+                # per name against the live namespace, so the trainer no longer renames.
+                _warn_wrapped_bases_missing(params, hf_names)
             logger.warning(
                 "weight sync: adapter mode, base_sync_done=%s, shipping %d tensors "
                 "(rank %d, %d wrapped projections)",
@@ -1178,22 +1196,9 @@ def _adapter_state_dict(wrappers, hf_names):
     return out
 
 
-def _insert_base_layer_suffix(params, hf_names):
-    """Rename each wrapped projection's HF base key to PEFT's ``base_layer`` form.
-
-    The base sync ships the FULL model -- embeddings, norms, experts, everything -- and
-    only the wrapped projections change name, because those are the ones the rollout
-    engine will wrap with an adapter. Shipping only the wrapped bases would leave the
-    rollout without the rest of the model.
-    """
-    renamed = dict(params)
-    missing = []
-    for fqn, hf_name in hf_names.items():
-        if hf_name in renamed:
-            stem = hf_name.removesuffix(".weight")
-            renamed[f"{stem}.base_layer.weight"] = renamed.pop(hf_name)
-        else:
-            missing.append((fqn, hf_name))
+def _warn_wrapped_bases_missing(params, hf_names) -> None:
+    """Name every wrapped projection whose HF base key is absent from the base half."""
+    missing = [(fqn, hf_name) for fqn, hf_name in hf_names.items() if hf_name not in params]
     if missing:
         # Reported, not silent -- and a warning rather than a raise, which is a real
         # distinction here. Two absences are legitimate: under PP a rank does not own
@@ -1209,14 +1214,12 @@ def _insert_base_layer_suffix(params, hf_names):
         shown = ", ".join(f"{fqn} -> {hf}" for fqn, hf in missing[:5])
         logger.warning(
             "weight sync: %d wrapped projection(s) have no matching key in the "
-            "converted state dict, so their bases ship un-suffixed. Legitimate under "
-            "PP or for graft-only targets; otherwise the rollout will look for "
-            "base_layer and fail. %s%s",
+            "converted state dict, so their bases do not ship. Legitimate under "
+            "PP or for graft-only targets; otherwise the rollout keeps a stale base. %s%s",
             len(missing),
             shown,
             " ..." if len(missing) > 5 else "",
         )
-    return renamed
 
 
 def _merged_state_dict_if_lora(module):
