@@ -758,9 +758,12 @@ class TorchTitanEngine(BaseEngine):
             # Point the checksum probe at the adapters: they are the only tensors that
             # move under LoRA, and the base half is frozen by construction. lora_b
             # starts at zero, so lora_a is listed first -- a zero digest on step 1 is
-            # correct but reads like a broken probe.
+            # correct but reads like a broken probe. Core names them
+            # ``<fqn>.lora_a.weight``; the earlier wrapper ``<fqn>.lora_a``.
             merged_lora_keys = {
-                k for k in params if k.endswith(("lora_a", "lora_b"))
+                k
+                for k in params
+                if k.endswith(("lora_a", "lora_b", "lora_a.weight", "lora_b.weight"))
             }
         else:
             for module in self.module:
@@ -906,13 +909,49 @@ def _titan_lora_wrappers(module):
     """
     found = {}
     for name, sub in module.named_modules():
-        if (
-            hasattr(sub, "lora_a")
-            and hasattr(sub, "lora_b")
-            and hasattr(sub, "base")
-        ):
+        if _is_lora_wrapper(sub):
             found[name] = sub
     return found
+
+
+def _is_lora_wrapper(sub) -> bool:
+    """torchtitan core's LoRA linear (``LoRALinearBase``: the base ``weight`` on the
+    module, ``lora_a`` / ``lora_b`` as Linear submodules) or the earlier model-local
+    wrapper (``base`` submodule, adapter tensors as parameters)."""
+    try:
+        from torchtitan.components.lora import LoRALinearBase
+    except ImportError:  # pragma: no cover - trees without core LoRA
+        LoRALinearBase = ()
+    if LoRALinearBase and isinstance(sub, LoRALinearBase):
+        return True
+    return hasattr(sub, "lora_a") and hasattr(sub, "lora_b") and hasattr(sub, "base")
+
+
+def _lora_prefix(mod_name: str, sd: dict) -> str:
+    """The state-dict prefix of a LoRA wrapper reached at ``mod_name``.
+
+    Wrapper segments (activation checkpointing, FSDP, compile) appear in
+    ``named_modules()`` paths but not in ``state_dict()`` keys. Core keys the
+    adapters ``<prefix>.lora_a.weight`` (a Linear), the earlier wrapper
+    ``<prefix>.lora_a``; both are accepted, and an unknown wrapper raises rather
+    than guessing a name nothing downstream would load.
+    """
+    segments = {"_checkpoint_wrapped_module", "_fsdp_wrapped_module", "_orig_mod"}
+    stripped = ".".join(p for p in mod_name.split(".") if p not in segments)
+    for candidate in (stripped, mod_name):
+        if f"{candidate}.lora_a.weight" in sd or f"{candidate}.lora_a" in sd:
+            return candidate
+    raise KeyError(
+        f"LoRA module at {mod_name!r} has no matching state_dict entry (tried "
+        f"{stripped!r}); an unrecognised module wrapper is in the path"
+    )
+
+
+def _lora_factor(wrapper, name: str) -> torch.Tensor:
+    """The adapter factor ``lora_a`` / ``lora_b`` as a tensor, whether the wrapper
+    keeps it as a Linear submodule (core) or as a parameter (the earlier wrapper)."""
+    factor = getattr(wrapper, name)
+    return factor.weight if hasattr(factor, "weight") else factor
 
 
 def _peft_config_from_wrappers(wrappers):
@@ -931,9 +970,9 @@ def _peft_config_from_wrappers(wrappers):
     from peft import TaskType
 
     any_wrapper = next(iter(wrappers.values()))
-    rank = int(any_wrapper.lora_a.shape[0])
+    rank = int(_lora_factor(any_wrapper, "lora_a").shape[0])
     alpha = float(getattr(any_wrapper, "_lora_scaling", 1.0)) * rank
-    ranks = {int(w.lora_a.shape[0]) for w in wrappers.values()}
+    ranks = {int(_lora_factor(w, "lora_a").shape[0]) for w in wrappers.values()}
     if len(ranks) > 1:
         raise ValueError(
             f"adapter-only sync needs one rank for all wrappers, got {sorted(ranks)}"
@@ -962,8 +1001,6 @@ def _wrapped_hf_base_names(sd_adapter, wrappers, full_state_dict):
     ``to_hf`` itself cannot carry the adapters: it drops every ``lora_a`` / ``lora_b``
     key by design, because the HF key space is the original Kimi architecture.
     """
-    from torchtitan.models.kimi_k3.lora import _state_dict_prefix
-
     text_only = sd_adapter._is_text_only(full_state_dict)
     # The fqns come from named_modules(), which KEEPS wrapper segments that state_dict()
     # strips: under activation checkpointing `layers.0.ffn.gate_proj` is
@@ -976,7 +1013,7 @@ def _wrapped_hf_base_names(sd_adapter, wrappers, full_state_dict):
     # makes it VALIDATE against the state dict instead of guessing a stripped name.
     return {
         fqn: sd_adapter._tt_key_to_hf(
-            f"{_state_dict_prefix(fqn, full_state_dict)}.weight", text_only
+            f"{_lora_prefix(fqn, full_state_dict)}.weight", text_only
         )
         for fqn in wrappers
     }
@@ -997,8 +1034,8 @@ def _adapter_state_dict(wrappers, hf_names):
     out = {}
     for fqn, wrapper in wrappers.items():
         stem = hf_names[fqn].removesuffix(".weight")
-        out[f"{stem}.lora_A.weight"] = wrapper.lora_a
-        out[f"{stem}.lora_B.weight"] = wrapper.lora_b
+        out[f"{stem}.lora_A.weight"] = _lora_factor(wrapper, "lora_a")
+        out[f"{stem}.lora_B.weight"] = _lora_factor(wrapper, "lora_b")
     return out
 
 
@@ -1061,13 +1098,19 @@ def _merged_state_dict_if_lora(module):
     Non-LoRA models take the plain path -- the import and the scan are both skipped
     unless a wrapper is actually present.
     """
-    has_lora = any(
-        hasattr(m, "lora_a") and hasattr(m, "lora_b") and hasattr(m, "base")
-        for m in module.modules()
-    )
-    if not has_lora:
+    try:
+        from torchtitan.components.lora import LoRALinearBase
+    except ImportError:  # pragma: no cover
+        LoRALinearBase = ()
+    wrappers = {
+        name: m
+        for name, m in module.named_modules()
+        if (LoRALinearBase and isinstance(m, LoRALinearBase))
+        or (hasattr(m, "lora_a") and hasattr(m, "lora_b") and hasattr(m, "base"))
+    }
+    if not wrappers:
         return module.state_dict(), frozenset()
-    from torchtitan.models.kimi_k3.lora import merge_lora_state_dict
+    from torchtitan.components.lora import merge_lora_state_dict
 
     # Merged because the run asked for it (model.lora.merge=True, the default). A run
     # with merge=False takes the adapter-only path in get_per_tensor_param instead and
@@ -1085,8 +1128,20 @@ def _merged_state_dict_if_lora(module):
     # otherwise takes the first floating-point key in sorted order, which is
     # embed_tokens.weight -- frozen under LoRA, so its checksum is constant whether the
     # sync works or not. Measured: four syncs, four identical digests, proving nothing.
-    raw = set(module.state_dict())
-    return merged, frozenset(k for k in merged if k not in raw)
+    # Core's merge keeps the base keys' names (``<fqn>.weight``, merged in place) and
+    # drops the adapter keys, so "new keys" is empty there; the keys that MOVE are the
+    # wrapped bases, named through the same prefix rule the merge uses.
+    raw = module.state_dict()
+    segments = {"_checkpoint_wrapped_module", "_fsdp_wrapped_module", "_orig_mod"}
+    moved = set()
+    for fqn in wrappers:
+        stripped = ".".join(p for p in fqn.split(".") if p not in segments)
+        for candidate in (stripped, fqn):
+            if f"{candidate}.weight" in merged:
+                moved.add(f"{candidate}.weight")
+                break
+    moved.update(k for k in merged if k not in raw)
+    return merged, frozenset(moved)
 
 
 class EngineEvalModeCtx(BaseEngineCtx):
