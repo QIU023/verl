@@ -345,6 +345,18 @@ class vLLMColocateWorkerExtension:
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
 
+        # DIAGNOSTIC (KIMI_GRPO_DUMP_VLLM=<dir>): the rollout model's parameters and buffers after the first
+        # sync, vLLM-internal names, so they can be compared with a disk-loaded vLLM model offline.
+        dump_dir = os.environ.get("KIMI_GRPO_DUMP_VLLM")
+        if dump_dir and not getattr(self, "_vllm_sync_dumped", False):
+            self._vllm_sync_dumped = True
+            m = self.model_runner.model
+            d = {n: p.detach().to("cpu") for n, p in m.named_parameters()}
+            d.update({("buffer:" + n): b.detach().to("cpu") for n, b in m.named_buffers()})
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(d, os.path.join(dump_dir, f"vllm_after_sync_rank{os.environ.get('VERL_REPLICA_RANK', '0')}_{os.getpid()}.pt"))
+            logger.info(f"KIMI_GRPO_DUMP_VLLM: wrote {len(d)} tensors")
+
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
 
