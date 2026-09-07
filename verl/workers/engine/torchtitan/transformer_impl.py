@@ -766,6 +766,20 @@ class TorchTitanEngine(BaseEngine):
             self.checkpointer.load(step=-1)
 
         torch.distributed.barrier()
+        # DIAGNOSTIC, off unless KIMI_GRPO_DUMP_SYNC=<dir>: write the HF-named tensors of the
+        # first sync (full tensors) so they can be compared with the HF export offline.
+        dump_dir = _os.environ.get("KIMI_GRPO_DUMP_SYNC")
+        if dump_dir and not getattr(self, "_sync_dumped", False):
+            self._sync_dumped = True
+            full = {}
+            for k, v in params.items():
+                t = v.full_tensor() if hasattr(v, "full_tensor") else v
+                full[k] = t.detach().to("cpu")
+            if torch.distributed.get_rank() == 0:
+                _os.makedirs(dump_dir, exist_ok=True)
+                torch.save(full, _os.path.join(dump_dir, "sync_step1.pt"))
+                print(f"KIMI_GRPO_DUMP_SYNC: wrote {len(full)} tensors to {dump_dir}", file=sys.stderr, flush=True)
+
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
@@ -1104,6 +1118,25 @@ def _guard_fsdp_grad_upcast() -> None:
         return original(self)
 
     FSDPParam.to_accumulated_grad_if_needed = guarded
+
+
+def _cu_seqlens_from_positions(positions):
+    """Packed offsets ``[0, ..., T]`` of a folded ``[T]`` (or ``[1, T]``) stream from its
+    positions: a document starts where the position restarts at 0. ``None`` without an
+    interior restart, so a single sequence keeps the single-sequence kernels."""
+    if positions is None:
+        return None
+    if positions.dim() == 2 and positions.shape[0] == 1:
+        positions = positions[0]
+    if positions.dim() != 1:
+        return None
+    num_tokens = positions.shape[0]
+    starts = torch.nonzero(positions == 0).flatten()
+    if starts.numel() == 0 or int(starts[0]) != 0:
+        starts = torch.cat((starts.new_zeros(1), starts))
+    if starts.numel() == 1:
+        return None
+    return torch.cat((starts, starts.new_full((1,), num_tokens))).to(torch.int32)
 
 
 def _titan_lora_wrappers(module):
@@ -1583,6 +1616,16 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     extra_inputs["positions"] = extra_inputs["positions"].unsqueeze(0)
             if masks is not None:
                 extra_kwargs["attention_masks"] = masks
+
+        if self._folded_token_stream:
+            # Kimi K3's KDA and short convolution take the packed stream's
+            # document offsets explicitly under flex attention; a micro-batch
+            # here packs several sequences, and without them the recurrent
+            # state runs across sequences. A document starts where the
+            # positions restart at 0.
+            cu_seqlens = _cu_seqlens_from_positions(extra_inputs.get("positions"))
+            if cu_seqlens is not None:
+                extra_kwargs["cu_seqlens"] = cu_seqlens
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
