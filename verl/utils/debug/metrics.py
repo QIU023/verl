@@ -82,6 +82,14 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     rollout_old_log_probs = data.batch["rollout_log_probs"]
     actor_old_log_probs = data.batch["old_log_probs"]
+    # DIAGNOSTIC, off unless KIMI_GRPO_DUMP_LOGPROBS=<dir>: keep one batch's tokens and both
+    # log-prob arrays so the actor's extraction can be checked against a plain forward offline.
+    import os as _os
+    _dump = _os.environ.get("KIMI_GRPO_DUMP_LOGPROBS")
+    if _dump and not _os.path.exists(_os.path.join(_dump, "batch.pt")):
+        _os.makedirs(_dump, exist_ok=True)
+        keep = {k: data.batch[k].detach().cpu() for k in ("input_ids", "responses", "attention_mask", "response_mask", "old_log_probs", "rollout_log_probs") if k in data.batch}
+        torch.save(keep, _os.path.join(_dump, "batch.pt"))
     if "response_mask" in data.batch:
         logger.debug("response mask found, use it to mask log probs")
         log_prob_mask = data.batch["response_mask"]
