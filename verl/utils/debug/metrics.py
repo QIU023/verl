@@ -88,7 +88,7 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     _dump = _os.environ.get("KIMI_GRPO_DUMP_LOGPROBS")
     if _dump and not _os.path.exists(_os.path.join(_dump, "batch.pt")):
         _os.makedirs(_dump, exist_ok=True)
-        keep = {k: data.batch[k].detach().cpu() for k in ("input_ids", "responses", "attention_mask", "response_mask", "old_log_probs", "rollout_log_probs") if k in data.batch}
+        keep = {k: v.detach().cpu() for k, v in data.batch.items() if torch.is_tensor(v)}
         torch.save(keep, _os.path.join(_dump, "batch.pt"))
     if "response_mask" in data.batch:
         logger.debug("response mask found, use it to mask log probs")
