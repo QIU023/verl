@@ -1568,7 +1568,13 @@ class PPOTrainer(ABC):
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
+        # DIAGNOSTIC (KIMI_GRPO_DUMP_LOGPROBS): also fetch the prompt tokens so the batch can be rescored offline.
+        import os as _os
+        if _os.environ.get("KIMI_GRPO_DUMP_LOGPROBS"):
+            fields.append("prompts")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        if "prompts" in data.keys():
+            data["prompt_lengths"] = data["prompts"].offsets().diff()
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])

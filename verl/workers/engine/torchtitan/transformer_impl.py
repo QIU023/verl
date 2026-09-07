@@ -767,20 +767,6 @@ class TorchTitanEngine(BaseEngine):
             self.checkpointer.load(step=-1)
 
         torch.distributed.barrier()
-        # DIAGNOSTIC, off unless KIMI_GRPO_DUMP_SYNC=<dir>: write the HF-named tensors of the
-        # first sync (full tensors) so they can be compared with the HF export offline.
-        dump_dir = _os.environ.get("KIMI_GRPO_DUMP_SYNC")
-        if dump_dir and not getattr(self, "_sync_dumped", False):
-            self._sync_dumped = True
-            full = {}
-            for k, v in params.items():
-                t = v.full_tensor() if hasattr(v, "full_tensor") else v
-                full[k] = t.detach().to("cpu")
-            if torch.distributed.get_rank() == 0:
-                _os.makedirs(dump_dir, exist_ok=True)
-                torch.save(full, _os.path.join(dump_dir, "sync_step1.pt"))
-                print(f"KIMI_GRPO_DUMP_SYNC: wrote {len(full)} tensors to {dump_dir}", file=sys.stderr, flush=True)
-
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
@@ -1012,6 +998,25 @@ class TorchTitanEngine(BaseEngine):
                 logger.warning("SYNC-CHECKSUM %s %s", digest, k)
                 print(f"SYNC-CHECKSUM {digest} {k}", file=sys.stderr, flush=True)
 
+        # DIAGNOSTIC, off unless KIMI_GRPO_DUMP_SYNC=<dir>: write the HF-named tensors of the
+        # first sync (full tensors) so they can be compared with the HF export offline.
+        dump_dir = _os.environ.get("KIMI_GRPO_DUMP_SYNC")
+        if dump_dir and not getattr(self, "_sync_dumped", False):
+            self._sync_dumped = True
+            # A few representative tensors only: an expert stack's first and last expert,
+            # a router gate, an attn-res projection, the embedding and a KDA weight.
+            want = [k for k in params if any(t in k for t in (".layers.1.", ".layers.0.", "embed_tokens", "lm_head"))]
+            full = {}
+            for k in want:
+                v = params[k]
+                t = v.full_tensor() if hasattr(v, "full_tensor") else v
+                full[k] = t.detach().to("cpu")
+            if torch.distributed.get_rank() == 0:
+                _os.makedirs(dump_dir, exist_ok=True)
+                torch.save(full, _os.path.join(dump_dir, "sync_step1.pt"))
+                print(f"KIMI_GRPO_DUMP_SYNC: wrote {len(full)} tensors to {dump_dir}", file=sys.stderr, flush=True)
+
+
         if self._is_offload_param:
             for module in self.module:
                 offload_fsdp_model_to_cpu(module)
@@ -1033,6 +1038,18 @@ class TorchTitanEngine(BaseEngine):
             if adapter_mode:
                 hf_names = _wrapped_hf_base_names(sd_adapter, wrappers, params)
             params = sd_adapter.to_hf(params)
+
+        # DIAGNOSTIC (KIMI_GRPO_DUMP_SYNC): the same tensors after to_hf, as the rollout receives them.
+        if dump_dir and not getattr(self, "_sync_dumped_hf", False):
+            self._sync_dumped_hf = True
+            full = {}
+            for k, v in params.items():
+                if any(t in k for t in (".layers.1.", ".layers.0.", "embed_tokens", "lm_head")):
+                    t = v.full_tensor() if hasattr(v, "full_tensor") else v
+                    full[k] = t.detach().to("cpu")
+            if torch.distributed.get_rank() == 0:
+                torch.save(full, _os.path.join(dump_dir, "sync_step1_hf.pt"))
+                print(f"KIMI_GRPO_DUMP_SYNC: wrote {len(full)} HF-named tensors", file=sys.stderr, flush=True)
         elif adapter_mode:
             raise ValueError(
                 "adapter-only weight sync needs the state-dict adapter to name the "
