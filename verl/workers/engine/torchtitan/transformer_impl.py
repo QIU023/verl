@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 import importlib
 import inspect
 import logging
+import sys
 import os
 import re
 from contextlib import nullcontext
@@ -950,6 +951,7 @@ class TorchTitanEngine(BaseEngine):
                 self._frozen_sync_params = {
                     k: v.detach().clone() for k, v in params.items()
                 }
+                print(f"KIMI_GRPO_FREEZE_SYNC=1: caching {len(params)} tensors", file=sys.stderr, flush=True)
                 logger.warning(
                     "KIMI_GRPO_FREEZE_SYNC=1: caching %d tensors and shipping them "
                     "to the rollout engine for every later step. DIAGNOSTIC ONLY -- "
@@ -988,7 +990,10 @@ class TorchTitanEngine(BaseEngine):
                 digest = _hl.sha256(
                     t.detach().float().cpu().contiguous().numpy().tobytes()
                 ).hexdigest()[:16]
+                # Also on stderr: under Ray the engine logger's warnings never reach the
+                # worker or driver logs, and this line is the sync's only direct witness.
                 logger.warning("SYNC-CHECKSUM %s %s", digest, k)
+                print(f"SYNC-CHECKSUM {digest} {k}", file=sys.stderr, flush=True)
 
         if self._is_offload_param:
             for module in self.module:
