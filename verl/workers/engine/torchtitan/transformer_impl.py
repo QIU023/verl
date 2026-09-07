@@ -1112,7 +1112,39 @@ class TorchTitanEngine(BaseEngine):
             per_tensor_param = itertools.chain(
                 per_tensor_param, self._iter_expert_stacks(expert_stacks, sd_adapter, device)
             )
+        # Under a pipeline each rank holds its stage's layers only, and to_hf names only those, so
+        # a rank feeding one rollout replica would ship its stage and the replica keeps its dummy
+        # init for the other stages. Every pipeline rank yields every stage's tensors instead.
+        if self.parallel_dims.pp_enabled:
+            per_tensor_param = self._iter_pp_gathered(per_tensor_param, device)
         return per_tensor_param, peft_config
+
+    def _iter_pp_gathered(self, gen, device):
+        """Stream the stages in order: the owning rank yields its own tensors and broadcasts them, the
+        other pipeline ranks receive and yield the same sequence; one tensor in flight at a time."""
+        pp_mesh = self.parallel_dims.get_mesh("pp")
+        group = pp_mesh.get_group()
+        ranks = torch.distributed.get_process_group_ranks(group)
+        mine = pp_mesh.get_local_rank()
+        for stage in range(pp_mesh.size()):
+            src = ranks[stage]
+            if stage == mine:
+                for name, tensor in gen:
+                    t = tensor.to(device).contiguous()
+                    torch.distributed.broadcast_object_list([(name, tuple(t.shape), t.dtype)], src=src, group=group)
+                    torch.distributed.broadcast(t, src=src, group=group)
+                    yield name, t
+                torch.distributed.broadcast_object_list([None], src=src, group=group)
+            else:
+                while True:
+                    box = [None]
+                    torch.distributed.broadcast_object_list(box, src=src, group=group)
+                    if box[0] is None:
+                        break
+                    name, shape, dtype = box[0]
+                    t = torch.empty(shape, dtype=dtype, device=device)
+                    torch.distributed.broadcast(t, src=src, group=group)
+                    yield name, t
 
     @staticmethod
     def _iter_expert_stacks(stacks: dict, sd_adapter, device):
