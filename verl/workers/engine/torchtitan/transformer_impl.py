@@ -17,6 +17,7 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 
 import gc
 import importlib
+import itertools
 import inspect
 import logging
 import sys
@@ -1018,6 +1019,16 @@ class TorchTitanEngine(BaseEngine):
         # Convert TorchTitan key names to HuggingFace key names (expected by vLLM)
         sd_adapter = self.checkpointer.sd_adapter
         hf_names = {}
+        # A sharded expert stack is gathered whole and split into every expert at the end of the
+        # generator (_iter_expert_stacks): to_hf names only the LOCAL experts of a dim-0-sharded
+        # stack -- the DCP convention, where the checkpoint reassembles the ranks -- so a rank feeding
+        # one rollout replica would ship its share of the experts and the replica keeps its dummy
+        # init for the rest. The adapter-only half carries no expert stacks.
+        expert_stacks = {}
+        if sd_adapter is not None and not (adapter_mode and base_sync_done):
+            for name in list(params):
+                if isinstance(params[name], DTensor) and self._expert_stack_slots(name, params[name]) is not None:
+                    expert_stacks[name] = params.pop(name)
         if sd_adapter is not None:
             if adapter_mode:
                 hf_names = _wrapped_hf_base_names(sd_adapter, wrappers, params)
@@ -1080,7 +1091,20 @@ class TorchTitanEngine(BaseEngine):
                 )
                 for name, param in params.items()
             )
+        if expert_stacks:
+            per_tensor_param = itertools.chain(
+                per_tensor_param, self._iter_expert_stacks(expert_stacks, sd_adapter, device)
+            )
         return per_tensor_param, peft_config
+
+    @staticmethod
+    def _iter_expert_stacks(stacks: dict, sd_adapter, device):
+        """Gather each sharded expert stack whole, one stack at a time, and yield every expert under its HF name."""
+        for name in sorted(stacks):
+            full = stacks[name].to(device, non_blocking=True).full_tensor()
+            for hf_name, expert in sd_adapter.to_hf({name: full}).items():
+                yield hf_name, expert.to(torch.bfloat16).contiguous()
+            del full
 
 
 _FSDP_GRAD_UPCAST_GUARDED = False
@@ -1624,6 +1648,12 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             # state runs across sequences. A document starts where the
             # positions restart at 0.
             cu_seqlens = _cu_seqlens_from_positions(extra_inputs.get("positions"))
+            if cu_seqlens is not None and self.parallel_dims.cp_enabled:
+                # The KDA context-parallel path runs one document per batch.
+                raise NotImplementedError(
+                    "Kimi K3 under context parallel takes one sequence per micro-batch: set "
+                    "log_prob_micro_batch_size_per_gpu=1 and ppo_micro_batch_size_per_gpu=1"
+                )
             if cu_seqlens is not None:
                 extra_kwargs["cu_seqlens"] = cu_seqlens
 
