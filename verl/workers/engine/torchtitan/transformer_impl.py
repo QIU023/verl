@@ -1163,14 +1163,35 @@ class TorchTitanEngine(BaseEngine):
                     torch.distributed.broadcast(t, src=src, group=group)
                     yield name, t
 
-    @staticmethod
-    def _iter_expert_stacks(stacks: dict, sd_adapter, device):
-        """Gather each sharded expert stack whole, one stack at a time, and yield every expert under its HF name."""
+    def _iter_expert_stacks(self, stacks: dict, sd_adapter, device):
+        """Gather each sharded expert stack whole, one stack at a time, and yield every expert under its HF name.
+
+        A stack owned by a fake-quant QAT experts module ships as the actor computes with it,
+        dequant(quant(w)): the rollout then samples the quantized policy the actor scores (and
+        the one that deploys), not the bf16 masters. Whole-tensor MX quantization equals the
+        actor's per-shard one whenever the shard boundary does not cut the blocked (last) dim.
+        """
+        try:
+            from torchtitan.components.quantization.mx_qat import _BLOCK, _WEIGHT_ELEM, MXQATExpertsBase, _fake_quant_mx
+        except ImportError:  # a tree without the QAT converter
+            MXQATExpertsBase = None
         for name in sorted(stacks):
             full = stacks[name].to(device, non_blocking=True).full_tensor()
+            if MXQATExpertsBase is not None and isinstance(self._owning_module(name), MXQATExpertsBase):
+                full = _fake_quant_mx(full, _WEIGHT_ELEM, _BLOCK)
             for hf_name, expert in sd_adapter.to_hf({name: full}).items():
                 yield hf_name, expert.to(torch.bfloat16).contiguous()
             del full
+
+    def _owning_module(self, param_fqn: str):
+        """The module that owns ``param_fqn`` in whichever model part holds it, else ``None``."""
+        module_fqn = param_fqn.rsplit(".", 1)[0]
+        for part in self.module:
+            try:
+                return part.get_submodule(module_fqn)
+            except AttributeError:
+                continue
+        return None
 
 
 _FSDP_GRAD_UPCAST_GUARDED = False
