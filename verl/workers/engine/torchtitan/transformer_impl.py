@@ -547,6 +547,33 @@ class TorchTitanEngine(BaseEngine):
             params["lm_head.weight"] = params["model.embed_tokens.weight"]
         return params
 
+    def _as_the_actor_computes(self, param_fqn: str, full: torch.Tensor) -> torch.Tensor:
+        """The gathered expert stack as the actor's forward consumes it.
+
+        A fake-quant QAT experts module (torchtitan's MXFP4/MXFP8 converter) computes with
+        dequant(quant(w)); shipping the bf16 masters would make the rollout sample a policy the
+        actor never scores. Whole-tensor MX quantization equals the actor's per-shard one whenever
+        the shard boundary does not cut the blocked (last) dim.
+        """
+        try:
+            from torchtitan.components.quantization.mx_qat import _BLOCK, _WEIGHT_ELEM, MXQATExpertsBase, _fake_quant_mx
+        except ImportError:  # a torchtitan without the QAT converter
+            return full
+        module = self._owning_module(param_fqn)
+        if isinstance(module, MXQATExpertsBase):
+            return _fake_quant_mx(full, _WEIGHT_ELEM, _BLOCK)
+        return full
+
+    def _owning_module(self, param_fqn: str):
+        """The module that owns ``param_fqn`` in whichever model part holds it, else ``None``."""
+        module_fqn = param_fqn.rsplit(".", 1)[0]
+        for part in self.module:
+            try:
+                return part.get_submodule(module_fqn)
+            except AttributeError:
+                continue
+        return None
+
     def _expert_stack_slots(self, name: str, param: Any) -> Optional[list[tuple[str, tuple]]]:
         """If ``name`` is a fused expert stack, enumerate ALL its experts' HF tensors, else ``None``."""
         sd_adapter = self.checkpointer.sd_adapter
@@ -663,11 +690,11 @@ class TorchTitanEngine(BaseEngine):
                 else:
                     yield name, param
             # One stack at a time: the gathered (num_experts, ...) tensor is the peak allocation here.
-            for stack, slots in expert_stacks:
+            for name, (stack, slots) in zip(stacks, expert_stacks):
                 full = stack.to(device, non_blocking=True)
                 if isinstance(full, DTensor):
                     full = full.full_tensor()
-                full = full.to(torch.bfloat16, non_blocking=True)
+                full = self._as_the_actor_computes(name, full).to(torch.bfloat16, non_blocking=True)
                 for e, (hf_name, _shape) in enumerate(slots):
                     yield hf_name, full[e].clone()
                 del full
