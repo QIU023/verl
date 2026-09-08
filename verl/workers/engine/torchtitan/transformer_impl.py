@@ -20,6 +20,7 @@ import importlib
 import itertools
 import inspect
 import logging
+import math
 import sys
 import os
 import re
@@ -69,6 +70,7 @@ from verl.workers.engine.torchtitan.utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
+    iter_per_tensor_params_ep,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -640,6 +642,21 @@ class TorchTitanEngine(BaseEngine):
         parallel_dims = self.parallel_dims
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
+        # Under tensor parallel the head's logits come back as this rank's shard:
+        # of the vocabulary (loss-parallel layout, Kimi K3 under spmd_types) or of
+        # the sequence (a replicated head on a sequence-parallel stream). The loss
+        # side works on full [T, V] logits, so gather the sharded dim over the tp
+        # group -- before the CP gather below, tp being the inner split.
+        if parallel_dims.tp_enabled and pred.dim() == 3:
+            hf_config = self.model_config.hf_config
+            vocab = getattr(getattr(hf_config, "text_config", None), "vocab_size", None) or getattr(hf_config, "vocab_size", None)
+            tp_group = parallel_dims.get_mesh("tp").get_group()
+            if vocab is not None and pred.shape[-1] * parallel_dims.tp == vocab:
+                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=2, group=tp_group)
+            elif vocab is not None and pred.shape[-1] != vocab:
+                raise ValueError(f"logits vocab dim {pred.shape[-1]} is neither the vocabulary ({vocab}) nor its tp shard")
+            elif getattr(self.module[-1], "_sp_group", None) is not None:
+                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, group=tp_group)
         if parallel_dims.cp_enabled:
             # Inputs were seq-sharded across cp; the loss side works on
             # full sequences (see prepare_model_inputs), so gather the
@@ -1575,6 +1592,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     )
                     extra_kwargs["attention_masks"] = attention_mask
             output_args["pp_pad_len"] = pp_pad_len
+        pad_multiple = 1
         if self.parallel_dims.cp_enabled:
             # Context parallel wants a sequence it can cut evenly, and the flex
             # BlockMask wants each shard to be a whole number of 128-token
@@ -1586,10 +1604,15 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             # whose CP goes through the flex BlockMask needs whole blocks per
             # shard, so the modulus handed to it is cp * 2 * 128 there.
             cp_size = self.parallel_dims.cp
-            multiple = cp_size if self._model_cp_is_module_internal else cp_size * 2 * 128
+            pad_multiple = cp_size if self._model_cp_is_module_internal else cp_size * 2 * 128
+        if self.parallel_dims.tp_enabled:
+            # Sequence parallel scatters the token dim across the TP ranks, so the
+            # packed stream must divide by the TP degree as well.
+            pad_multiple = math.lcm(pad_multiple, self.parallel_dims.tp)
+        if pad_multiple > 1:
             pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             input_ids, position_ids, cp_pad_len = ulysses_pad(
-                input_ids, position_ids, sp_size=multiple, pad_value=pad_id
+                input_ids, position_ids, sp_size=pad_multiple, pad_value=pad_id
             )
             if cp_pad_len:
                 # The positions: ulysses_pad numbers the padding from zero,
@@ -1618,6 +1641,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                         attn_type=self.engine_config.attn_type,
                     )
                     extra_kwargs["attention_masks"] = attention_mask
+        if self.parallel_dims.cp_enabled:
             # prepare_context_parallel_input contract: positions must ride
             # in extra_kwargs (it seq-shards them alongside inputs/labels);
             # this engine keeps positions in extra_inputs, so bridge them
