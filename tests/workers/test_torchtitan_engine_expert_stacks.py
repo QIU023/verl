@@ -68,6 +68,8 @@ class TestExpertStacksGoWhole(unittest.TestCase):
 
         fake = types.SimpleNamespace(checkpointer=types.SimpleNamespace(sd_adapter=_Adapter()))
         fake._expert_stack_slots = lambda name, param: TorchTitanEngine._expert_stack_slots(fake, name, param)
+        fake.module = [torch.nn.Module()]  # no QAT experts anywhere: stacks ship as they are
+        fake._owning_module = lambda fqn: TorchTitanEngine._owning_module(fake, fqn)
         return TorchTitanEngine, fake
 
     def test_a_sharded_stack_is_detected_and_a_plain_matrix_is_not(self):
@@ -81,7 +83,7 @@ class TestExpertStacksGoWhole(unittest.TestCase):
         engine, fake = self._engine()
         local = torch.randn(4, 3, 2)
         stack = DTensor.from_local(local, self.mesh, [Shard(0)])
-        got = dict(engine._iter_expert_stacks({"layers.1.moe.experts.w1": stack}, fake.checkpointer.sd_adapter, "cpu"))
+        got = dict(engine._iter_expert_stacks(fake, {"layers.1.moe.experts.w1": stack}, fake.checkpointer.sd_adapter, "cpu"))
         self.assertEqual(sorted(got), [f"model.layers.1.moe.experts.{e}.w1.weight" for e in range(4)])
         for e in range(4):
             self.assertTrue(torch.equal(got[f"model.layers.1.moe.experts.{e}.w1.weight"], local[e].to(torch.bfloat16)))
