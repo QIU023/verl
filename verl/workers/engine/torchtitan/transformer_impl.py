@@ -37,13 +37,18 @@ from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfi
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+try:
+    from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+except ImportError:  # trees after PR 4639 shard CP batches through prepare_context_parallel_batch
+    prepare_context_parallel_input = None
 
 # torchtitan's CP input API changed shape: the current one takes the named inputs as a dict
 # and shards each along its declared sequence axis in place; the earlier one took
 # (inputs, labels, extra_kwargs, ...) positionally. Both are still met by trees this engine
 # runs on, so the call site below picks by signature.
-_CP_INPUT_DICT_API = "input_dict" in inspect.signature(prepare_context_parallel_input).parameters
+_CP_INPUT_DICT_API = prepare_context_parallel_input is not None and (
+    "input_dict" in inspect.signature(prepare_context_parallel_input).parameters
+)
 
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -1170,7 +1175,7 @@ class TorchTitanEngine(BaseEngine):
         actor's per-shard one whenever the shard boundary does not cut the blocked (last) dim.
         """
         try:
-            from torchtitan.components.quantization.mx_qat import _BLOCK, _WEIGHT_ELEM, MXQATExpertsBase, _fake_quant_mx
+            from torchtitan.quantization.mx_qat import _BLOCK, _WEIGHT_ELEM, MXQATExpertsBase, _fake_quant_mx
         except ImportError:  # a tree without the QAT converter
             MXQATExpertsBase = None
         for name in sorted(stacks):
@@ -1268,7 +1273,7 @@ def _is_lora_wrapper(sub) -> bool:
     module, ``lora_a`` / ``lora_b`` as Linear submodules) or the earlier model-local
     wrapper (``base`` submodule, adapter tensors as parameters)."""
     try:
-        from torchtitan.components.lora import LoRALinearBase
+        from torchtitan.config.transform.lora import LoRALinearBase
     except ImportError:  # pragma: no cover - trees without core LoRA
         LoRALinearBase = ()
     if LoRALinearBase and isinstance(sub, LoRALinearBase):
@@ -1433,7 +1438,7 @@ def _merged_state_dict_if_lora(module):
     unless a wrapper is actually present.
     """
     try:
-        from torchtitan.components.lora import LoRALinearBase
+        from torchtitan.config.transform.lora import LoRALinearBase
     except ImportError:  # pragma: no cover
         LoRALinearBase = ()
     wrappers = {
@@ -1444,7 +1449,7 @@ def _merged_state_dict_if_lora(module):
     }
     if not wrappers:
         return module.state_dict(), frozenset()
-    from torchtitan.components.lora import merge_lora_state_dict
+    from torchtitan.config.transform.lora import merge_lora_state_dict
 
     # Merged because the run asked for it (model.lora.merge=True, the default). A run
     # with merge=False takes the adapter-only path in get_per_tensor_param instead and
