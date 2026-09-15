@@ -17,6 +17,7 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 
 import importlib
 import itertools
+import contextlib
 import inspect
 import logging
 import math
@@ -50,6 +51,40 @@ _CP_INPUT_DICT_API = prepare_context_parallel_input is not None and (
     "input_dict" in inspect.signature(prepare_context_parallel_input).parameters
 )
 
+
+
+def _torch_accepts_bfx9() -> bool:
+    matmul = torch.backends.cuda.matmul
+    try:
+        previous = matmul.fp32_precision
+        matmul.fp32_precision = "bfx9"
+    except (AttributeError, RuntimeError, ValueError):
+        return False
+    matmul.fp32_precision = previous
+    return True
+
+
+@contextlib.contextmanager
+def _fp32_matmul_emulation_optional():
+    """Let Trainer start on a torch without BFX9 fp32 matmul emulation.
+
+    Current torchtitan refuses to start on compute capability >= 10.0 without it, and the
+    rollout's vLLM build pins a torch that predates it; fp32 matmuls then keep torch's default
+    precision.
+    """
+    gate = getattr(dist_utils, "enable_fp32_matmul_emulation_with_bf16x9", None)
+    if gate is None or _torch_accepts_bfx9():
+        yield
+        return
+
+    def warn_only() -> None:
+        logger.warning("torch lacks BFX9 matmul emulation; fp32 matmuls keep the default precision")
+
+    dist_utils.enable_fp32_matmul_emulation_with_bf16x9 = warn_only
+    try:
+        yield
+    finally:
+        dist_utils.enable_fp32_matmul_emulation_with_bf16x9 = gate
 
 def _parallelism_compat_kwargs(spmd_backend: str, torchtitan_name: str) -> dict:
     """ParallelismConfig fields whose shape differs across the torchtitan trees this engine runs on.
@@ -346,7 +381,8 @@ class TorchTitanEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
-        self.trainer = Trainer(self.config)
+        with _fp32_matmul_emulation_optional():
+            self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
 
