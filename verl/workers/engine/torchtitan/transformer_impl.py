@@ -1801,6 +1801,13 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 )
             if cu_seqlens is not None:
                 extra_kwargs["cu_seqlens"] = cu_seqlens
+            if extra_kwargs.get("attention_masks") is not None and not self.parallel_dims.cp_enabled:
+                # Kimi K3 builds its own masks from the [T] positions: current trees key them by
+                # consumer (a flex BlockMask for MLA, varlen offsets for KDA).
+                positions = extra_inputs["positions"]
+                if positions.dim() == 2 and positions.shape[0] == 1:
+                    positions = positions.squeeze(0)
+                extra_kwargs["attention_masks"] = self.module[0].get_attention_masks(positions=positions)
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
