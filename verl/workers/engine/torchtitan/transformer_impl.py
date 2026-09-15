@@ -50,6 +50,28 @@ _CP_INPUT_DICT_API = prepare_context_parallel_input is not None and (
     "input_dict" in inspect.signature(prepare_context_parallel_input).parameters
 )
 
+
+def _parallelism_compat_kwargs(spmd_backend: str, torchtitan_name: str) -> dict:
+    """ParallelismConfig fields whose shape differs across the torchtitan trees this engine runs on.
+
+    Older trees take ``spmd_backend``; current ones dropped it (spmd_types is the only backend).
+    Kimi K3's CP needs contiguous rank-ordered shards: the head-tail balancer permutes the
+    sequence before sharding. Older trees spell the balancer as a string (None disables it),
+    current ones as ``ContextParallelLoadBalancerConfig`` with ``load_balancer_type=None``.
+    """
+    fields = ParallelismConfig.__dataclass_fields__
+    kwargs = {}
+    if "spmd_backend" in fields:
+        kwargs["spmd_backend"] = spmd_backend
+    if torchtitan_name == "kimi_k3":
+        try:
+            from torchtitan.config import ContextParallelLoadBalancerConfig
+        except ImportError:
+            kwargs["context_parallel_load_balancer"] = None
+        else:
+            kwargs["context_parallel_load_balancer"] = ContextParallelLoadBalancerConfig(load_balancer_type=None)
+    return kwargs
+
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
@@ -271,17 +293,7 @@ class TorchTitanEngine(BaseEngine):
             num_pp_microbatches=max(1, self.engine_config.pipeline_parallel_size),
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend=self.engine_config.spmd_backend,
-            # kimi_k3's module-internal CP reassembles contiguous
-            # rank-ordered seq shards; the upstream default 'headtail'
-            # balancer PERMUTES the sequence before sharding, silently
-            # breaking causal order (future-token leakage) -- its
-            # parallelize raises on any balancer. Upstream-CP models
-            # (llama3/qwen3/...) keep the torchtitan default.
-            context_parallel_load_balancer=(
-                None if torchtitan_name == "kimi_k3"
-                else ParallelismConfig.context_parallel_load_balancer
-            ),
+            **_parallelism_compat_kwargs(self.engine_config.spmd_backend, torchtitan_name),
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
