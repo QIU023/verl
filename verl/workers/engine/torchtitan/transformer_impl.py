@@ -703,12 +703,14 @@ class TorchTitanEngine(BaseEngine):
             hf_config = self.model_config.hf_config
             vocab = getattr(getattr(hf_config, "text_config", None), "vocab_size", None) or getattr(hf_config, "vocab_size", None)
             tp_group = parallel_dims.get_mesh("tp").get_group()
+            # Every tp rank computes the same full loss, so the gather's backward takes this rank's
+            # slice unscaled; the Ulysses scaling would multiply every gradient by the tp degree.
             if vocab is not None and pred.shape[-1] * parallel_dims.tp == vocab:
-                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=2, group=tp_group)
+                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=2, grad_scaler=False, group=tp_group)
             elif vocab is not None and pred.shape[-1] != vocab:
                 raise ValueError(f"logits vocab dim {pred.shape[-1]} is neither the vocabulary ({vocab}) nor its tp shard")
             elif getattr(self.module[-1], "_sp_group", None) is not None:
-                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, group=tp_group)
+                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, grad_scaler=False, group=tp_group)
         if parallel_dims.cp_enabled:
             # Inputs were seq-sharded across cp; the loss side works on
             # full sequences (see prepare_model_inputs), so gather the
