@@ -504,6 +504,9 @@ class TorchtitanEngineConfig(EngineConfig):
         context_parallel_size (int): Context parallel size, default 1
         context_parallel_backend (str): the CP backend for flex attention, "ulysses" (default; masks
             stay global) or "allgather_kv" (the flex BlockMask is sharded per rank)
+        initial_load_path (str | None): a torchtitan DCP checkpoint to start the trainer from instead
+            of the HF weights at model.path (a packed-MXFP4 QLoRA model has no HF spelling for its
+            bases); model.path still serves the rollout engine
         attn_type (str): Attention type for torchtitan's model (e.g., "sdpa", "flex", "varlen"),
             default "flex"
         spmd_backend (str): torchtitan SPMD backend, one of "default", "full_dtensor", "spmd_types",
@@ -540,6 +543,7 @@ class TorchtitanEngineConfig(EngineConfig):
     pipeline_parallel_size: int = 1
     context_parallel_size: int = 1
     context_parallel_backend: str = "ulysses"
+    initial_load_path: Optional[str] = None
     attn_type: str = "flex"
     spmd_backend: str = "spmd_types"
     activation_checkpoint: str = "selective"
