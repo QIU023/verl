@@ -502,6 +502,8 @@ class TorchtitanEngineConfig(EngineConfig):
         expert_tensor_parallel_size (int): Expert tensor parallel size, default 1
         pipeline_parallel_size (int): Pipeline parallel size, default 1
         context_parallel_size (int): Context parallel size, default 1
+        context_parallel_backend (str): the CP backend for flex attention, "ulysses" (default; masks
+            stay global) or "allgather_kv" (the flex BlockMask is sharded per rank)
         attn_type (str): Attention type for torchtitan's model (e.g., "sdpa", "flex", "varlen"),
             default "flex"
         spmd_backend (str): torchtitan SPMD backend, one of "default", "full_dtensor", "spmd_types",
@@ -537,6 +539,7 @@ class TorchtitanEngineConfig(EngineConfig):
     expert_tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     context_parallel_size: int = 1
+    context_parallel_backend: str = "ulysses"
     attn_type: str = "flex"
     spmd_backend: str = "spmd_types"
     activation_checkpoint: str = "selective"
