@@ -343,11 +343,14 @@ class TorchTitanEngine(BaseEngine):
                 self.engine_config.spmd_backend, self.engine_config.context_parallel_size > 1
             ),
         )
+        # A torchtitan DCP checkpoint takes precedence over the HF weights at model.path: a
+        # model whose frozen bases are packed (QLoRA) has no HF spelling for them.
+        dcp_path = self.engine_config.initial_load_path
         checkpoint = CheckpointManager.Config(
             enable=True,
-            initial_load_in_hf=True,
+            initial_load_in_hf=dcp_path is None,
             initial_load_model_only=True,
-            initial_load_path=model_config.path,
+            initial_load_path=dcp_path or model_config.path,
             # verl's trainer.save_freq is the cadence authority and save() is
             # only called on those steps; defer torchtitan's own interval to 1
             # so every requested save writes (default 500 silently drops all
