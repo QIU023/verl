@@ -331,6 +331,7 @@ class TorchTitanEngine(BaseEngine):
             data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
             fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
             tensor_parallel_degree=self.engine_config.tensor_parallel_size,
+            enable_sequence_parallel=self.engine_config.sequence_parallel,
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             # The engine feeds the schedule in chunks of this many verl micro-batches
             # (torch requires at least one per stage), padding a short tail chunk.
