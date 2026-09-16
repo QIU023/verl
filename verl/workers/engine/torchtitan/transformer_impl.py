@@ -18,7 +18,6 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 import importlib
 import itertools
 import contextlib
-import inspect
 import logging
 import math
 import sys
@@ -38,18 +37,7 @@ from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfi
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-try:
-    from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-except ImportError:  # trees after PR 4639 shard CP batches through prepare_context_parallel_batch
-    prepare_context_parallel_input = None
-
-# torchtitan's CP input API changed shape: the current one takes the named inputs as a dict
-# and shards each along its declared sequence axis in place; the earlier one took
-# (inputs, labels, extra_kwargs, ...) positionally. Both are still met by trees this engine
-# runs on, so the call site below picks by signature.
-_CP_INPUT_DICT_API = prepare_context_parallel_input is not None and (
-    "input_dict" in inspect.signature(prepare_context_parallel_input).parameters
-)
+from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 
 
 
@@ -86,26 +74,53 @@ def _fp32_matmul_emulation_optional():
     finally:
         dist_utils.enable_fp32_matmul_emulation_with_bf16x9 = gate
 
-def _parallelism_compat_kwargs(spmd_backend: str, torchtitan_name: str) -> dict:
+def _parallelism_compat_kwargs(spmd_backend: str, cp_enabled: bool) -> dict:
     """ParallelismConfig fields whose shape differs across the torchtitan trees this engine runs on.
 
     Older trees take ``spmd_backend``; current ones dropped it (spmd_types is the only backend).
-    Kimi K3's CP needs contiguous rank-ordered shards: the head-tail balancer permutes the
-    sequence before sharding. Older trees spell the balancer as a string (None disables it),
-    current ones as ``ContextParallelLoadBalancerConfig`` with ``load_balancer_type=None``.
+    Under context parallel the shards are contiguous and rank-ordered: the engine gathers the
+    logits back in rank order (_finish_pred), which a permuting balancer (head-tail) would scramble.
     """
     fields = ParallelismConfig.__dataclass_fields__
     kwargs = {}
     if "spmd_backend" in fields:
         kwargs["spmd_backend"] = spmd_backend
-    if torchtitan_name == "kimi_k3":
-        try:
-            from torchtitan.config import ContextParallelLoadBalancerConfig
-        except ImportError:
-            kwargs["context_parallel_load_balancer"] = None
-        else:
-            kwargs["context_parallel_load_balancer"] = ContextParallelLoadBalancerConfig(load_balancer_type=None)
+    if cp_enabled:
+        from torchtitan.config import ContextParallelLoadBalancerConfig
+
+        kwargs["context_parallel_load_balancer"] = ContextParallelLoadBalancerConfig(load_balancer_type=None)
     return kwargs
+
+
+def _context_parallel_transform(model_config, backend: str) -> ContextParallelTransform:
+    """The CP backends for the inner attentions this model config carries.
+
+    Flex attention takes the Ulysses backend by default: it keeps the attention masks
+    global, whereas the all-gather-KV backend shards the flex BlockMask through torch's
+    compiled ``create_block_mask``, which the colocated worker process cannot compile.
+    A KDA inner attention, where the tree has one, takes its CP routing counterpart.
+    Subtrees whose tokens are not sharded on the cp axis (a vision tower) keep their
+    local attention.
+    """
+    from torchtitan.models.common.attention import FlexInnerAttention
+    from torchtitan.models.common.cp_attention import (
+        KVAllGatherCPFlexInnerAttention,
+        UlyssesCPFlexInnerAttention,
+    )
+
+    flex_backends = {"ulysses": UlyssesCPFlexInnerAttention, "allgather_kv": KVAllGatherCPFlexInnerAttention}
+    if backend not in flex_backends:
+        raise ValueError(f"context_parallel_backend must be one of {sorted(flex_backends)}, got {backend!r}")
+    mapping: dict = {FlexInnerAttention.Config: flex_backends[backend]}
+    try:
+        from torchtitan.models.kimi_k3.cp_kda import ContextParallelInnerKDA
+        from torchtitan.models.kimi_k3.kda import InnerKDA
+    except ImportError:
+        pass
+    else:
+        if any(True for _ in model_config.traverse(InnerKDA.Config)):
+            mapping[InnerKDA.Config] = ContextParallelInnerKDA
+    return ContextParallelTransform(inner_attention=mapping, exclude_fqn_prefixes=("vision_encoder",))
 
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -255,12 +270,6 @@ class TorchTitanEngine(BaseEngine):
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
-        # kimi_k3 handles CP module-internally (Ulysses) and is causal-only:
-        # no attention_masks consumed, no upstream CP mask sharding needed.
-        self._model_cp_is_module_internal = torchtitan_name == "kimi_k3"
-        # Kimi K3 takes a folded [T] token stream (the model declared it on the earlier
-        # tree; on torchtitan main it is a property of the architecture, not an attribute).
-        self._folded_token_stream = torchtitan_name == "kimi_k3"
 
         # Get ModelSpec from model registry
         from .utils import _import_torchtitan_model_module
@@ -326,9 +335,13 @@ class TorchTitanEngine(BaseEngine):
             # The engine feeds the schedule in chunks of this many verl micro-batches
             # (torch requires at least one per stage), padding a short tail chunk.
             num_pp_microbatches=max(1, self.engine_config.pipeline_parallel_size),
-            context_parallel_degree=self.engine_config.context_parallel_size,
+            # The degree is set once the CP transform has replaced the inner attentions:
+            # Trainer.Config validates the pairing at construction (see below).
+            context_parallel_degree=1,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
-            **_parallelism_compat_kwargs(self.engine_config.spmd_backend, torchtitan_name),
+            **_parallelism_compat_kwargs(
+                self.engine_config.spmd_backend, self.engine_config.context_parallel_size > 1
+            ),
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -343,8 +356,8 @@ class TorchTitanEngine(BaseEngine):
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
-        # The kimi_k3 standard token dispatcher synchronizes with the CPU,
-        # which CUDA graphs cannot capture; run eager under expert parallel.
+        # The standard token dispatcher synchronizes with the CPU, which CUDA
+        # graphs cannot capture; run eager under expert parallel.
         training_kwargs["disable_cuda_graphs"] = True
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
@@ -381,8 +394,27 @@ class TorchTitanEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
+        if self.engine_config.context_parallel_size > 1:
+            # As torchtitan's own CP recipes do: raise the degree on the built config, then
+            # apply the transform, whose validated copy pairs the degree with the backends.
+            self.config.parallelism.context_parallel_degree = self.engine_config.context_parallel_size
+            self.config = apply_transforms(
+                self.config,
+                [
+                    _context_parallel_transform(
+                        self.config.model_spec.model, self.engine_config.context_parallel_backend
+                    )
+                ],
+            )
         with _fp32_matmul_emulation_optional():
             self.trainer = Trainer(self.config)
+        # Decoders on torchtitan main take a folded [T] token stream and own their input
+        # preprocessing (masks, CP shards, layouts); probed on the model, not on its name.
+        from torchtitan.protocols.model import BaseModel
+
+        self._folded_token_stream = (
+            type(self.trainer.model_parts[0]).preprocess_inputs is not BaseModel.preprocess_inputs
+        )
 
         self._init_device_mesh()
 
@@ -474,17 +506,10 @@ class TorchTitanEngine(BaseEngine):
 
     def _init_device_mesh(self):
         """Initialize the device mesh for TorchTitan style parallelism."""
-        world_size = torch.distributed.get_world_size()
-        self.parallel_dims = ParallelDims(
-            dp_shard=self.engine_config.data_parallel_shard_size,
-            dp_replicate=self.engine_config.data_parallel_replicate_size,
-            cp=self.engine_config.context_parallel_size,
-            tp=self.engine_config.tensor_parallel_size,
-            pp=self.engine_config.pipeline_parallel_size,
-            ep=self.engine_config.expert_parallel_size,
-            world_size=world_size,
-        )
-        self.device_mesh = self.parallel_dims.build_mesh()
+        # The trainer's ParallelDims and mesh: the model's SPMD context and the engine's
+        # gathers must name the same process groups.
+        self.parallel_dims = self.trainer.parallel_dims
+        self.device_mesh = self.parallel_dims._world_mesh
 
         # Mirror torchtitan's init_distributed (which verl bypasses): disable autograd
         # multithreading so backward-thread activation-checkpoint recompute can access the
@@ -665,16 +690,16 @@ class TorchTitanEngine(BaseEngine):
         parallel_dims = self.parallel_dims
 
         if parallel_dims.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported in model_forward_step. "
-                "This will be implemented in a follow-up PR."
+            raise RuntimeError(
+                "model_forward_step is the non-pipeline path; under pipeline parallelism the "
+                "worker drives the schedule through _pp_forward_backward_batch"
             )
         else:
             # Non-PP forward. train_context (SPMD mesh) is set by the caller.
             assert len(model_parts) == 1
             folded = getattr(model_parts[0], "folded_token_stream", False) or self._folded_token_stream
             if folded and inputs.dim() == 2 and inputs.shape[0] == 1:
-                # Folded-stream models (kimi_k3) take [T] token streams; the
+                # Folded-stream decoders take [T] token streams; the
                 # rmpad path packs to [1, T]. Fold in, unfold the logits out.
                 squeezed_inputs = inputs.squeeze(0)
                 squeezed_extra = {
@@ -712,13 +737,12 @@ class TorchTitanEngine(BaseEngine):
             elif getattr(self.module[-1], "_sp_group", None) is not None:
                 pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, grad_scaler=False, group=tp_group)
         if parallel_dims.cp_enabled:
-            # Inputs were seq-sharded across cp; the loss side works on
-            # full sequences (see prepare_model_inputs), so gather the
-            # logits back (differentiable -> reduce-scatter backward).
+            # Inputs were seq-sharded across cp; the loss side works on full sequences
+            # (see prepare_model_inputs), so gather the logits back. Every cp rank
+            # computes the same full loss and FSDP reduces over dp_shard x cp, so the
+            # backward takes this rank's slice unscaled, as for tp above.
             cp_group = parallel_dims.get_mesh("cp").get_group()
-            pred = gather_outputs_and_unpad(
-                pred.contiguous(), gather_dim=1, group=cp_group
-            )
+            pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, grad_scaler=False, group=cp_group)
         return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -1668,17 +1692,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             output_args["pp_pad_len"] = pp_pad_len
         pad_multiple = 1
         if self.parallel_dims.cp_enabled:
-            # Context parallel wants a sequence it can cut evenly, and the flex
-            # BlockMask wants each shard to be a whole number of 128-token
-            # blocks; a packed no-padding stream is neither. ulysses_pad does
-            # the padding, with two adjustments this engine needs.
-            #
-            # The multiple: ulysses_pad pads to the parallel degree, which is
-            # what a model whose CP lives inside its own modules needs; a model
-            # whose CP goes through the flex BlockMask needs whole blocks per
-            # shard, so the modulus handed to it is cp * 2 * 128 there.
-            cp_size = self.parallel_dims.cp
-            pad_multiple = cp_size if self._model_cp_is_module_internal else cp_size * 2 * 128
+            # Context parallel cuts the packed stream into contiguous rank-ordered shards
+            # (_parallelism_compat_kwargs) and the flex BlockMask wants whole 128-token
+            # blocks per shard; a packed no-padding stream is neither. ulysses_pad does
+            # the padding, with the adjustments below.
+            pad_multiple = self.parallel_dims.cp * 128
         if self.parallel_dims.tp_enabled:
             # Sequence parallel scatters the token dim across the TP ranks, so the
             # packed stream must divide by the TP degree as well.
@@ -1716,96 +1734,39 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     )
                     extra_kwargs["attention_masks"] = attention_mask
         if self.parallel_dims.cp_enabled:
-            # prepare_context_parallel_input contract: positions must ride
-            # in extra_kwargs (it seq-shards them alongside inputs/labels);
-            # this engine keeps positions in extra_inputs, so bridge them
-            # across the call. Was a latent KeyError -- this CP path had
-            # never been exercised before the kimi_k3 CP work.
-            extra_kwargs["positions"] = extra_inputs["positions"]
-            # Module-internal-CP models (kimi_k3) are causal-only and never
-            # consume attention_masks; upstream's BlockMask CP sharding also
-            # requires seq_len % (cp * 128) == 0, which SFT batches don't
-            # guarantee. Keep the mask out of the CP shard for them.
-            masks = (
-                extra_kwargs.pop("attention_masks", None)
-                if self._model_cp_is_module_internal
-                else None
+            # The model owns its context-parallel preprocessing on this tree: the masks
+            # from the positions, the shards, the KDA routing and the layouts. Hand it
+            # the folded [T] stream with the global positions and take back this
+            # rank's inputs and kwargs. Labels stay FULL length: verl's loss path
+            # (nested no-padding log_prob / loss_mask handling) assumes full
+            # sequences, so the engine all-gathers the seq-sharded logits after the
+            # model call (_finish_pred) instead of sharding the loss side.
+            if position_ids.dim() != 2 or position_ids.shape[0] != 1:
+                raise NotImplementedError("context parallel takes a [1, T] position stream")
+            batch = {
+                "input": input_ids.squeeze(0),
+                "labels": labels.squeeze(0),
+                "positions": position_ids.squeeze(0),
+            }
+            local_inputs, _labels_local, extra_kwargs = self.module[0].preprocess_inputs(
+                batch,
+                parallel_dims=self.parallel_dims,
+                parallelism=self.config.parallelism,
             )
-            # Keep labels FULL length: verl's loss path (nested no-padding
-            # log_prob/loss_mask handling) assumes full sequences, so the
-            # engine all-gathers the seq-sharded logits after the model
-            # call (model_forward_step) instead of sharding the loss side.
-            labels_full = labels
-            # cp_shard cuts dim 0 and this stream is [1, T] -- dim 0 is the
-            # fold, not the sequence, so sharding it hands every rank but the
-            # first an empty batch. Fold the stream down to [T] for the cut
-            # (the model's own contract anyway) and unfold after.
-            folded_for_cp = input_ids.dim() == 2 and input_ids.shape[0] == 1
-            if folded_for_cp:
-                input_ids = input_ids.squeeze(0)
-                labels = labels.squeeze(0)
-                positions = extra_kwargs["positions"]
-                extra_kwargs["positions"] = (
-                    positions.squeeze(0) if positions.dim() > 1 and positions.shape[0] == 1
-                    else positions
-                )
-            if _CP_INPUT_DICT_API:
-                # Labels stay out of the dict and full length (see above); the
-                # masks stay whole too -- the kernels this path serves declare
-                # shard_attention_mask False (a global mask per rank).
-                sharded = prepare_context_parallel_input(
-                    {"input": input_ids, "positions": extra_kwargs["positions"]},
-                    None,
-                    self.parallel_dims.get_mesh("cp"),
-                    # NO_PADDING packs variable-length sequences, so the
-                    # head-tail balancer's seq % (2*cp) == 0 precondition cannot
-                    # hold; shard contiguously.
-                    None,
-                    None,
-                    shard_attention_mask=False,
-                )
-                input_ids = sharded["input"]
-                extra_kwargs["positions"] = sharded["positions"]
-            else:
-                input_ids, _labels_sharded, extra_kwargs = prepare_context_parallel_input(
-                    input_ids,
-                    labels,
-                    extra_kwargs,
-                    self.parallel_dims.get_mesh("cp"),
-                    self.trainer.device,
-                    # NO_PADDING packs variable-length sequences, so the
-                    # head-tail balancer's seq % (2*cp) == 0 precondition cannot
-                    # hold; shard contiguously.
-                    None,
-                )
-            labels = labels_full
-            extra_inputs["positions"] = extra_kwargs.pop("positions")
-            if folded_for_cp:
-                # Back to the rmpad layout the rest of the engine expects.
-                input_ids = input_ids.unsqueeze(0)
-                if extra_inputs["positions"].dim() == 1:
-                    extra_inputs["positions"] = extra_inputs["positions"].unsqueeze(0)
-            if masks is not None:
-                extra_kwargs["attention_masks"] = masks
-
-        if self._folded_token_stream:
+            input_ids = local_inputs.unsqueeze(0)
+            extra_inputs = {}
+        elif self._folded_token_stream:
             # Kimi K3's KDA and short convolution take the packed stream's
             # document offsets explicitly under flex attention; a micro-batch
             # here packs several sequences, and without them the recurrent
             # state runs across sequences. A document starts where the
             # positions restart at 0.
             cu_seqlens = _cu_seqlens_from_positions(extra_inputs.get("positions"))
-            if cu_seqlens is not None and self.parallel_dims.cp_enabled:
-                # The KDA context-parallel path runs one document per batch.
-                raise NotImplementedError(
-                    "Kimi K3 under context parallel takes one sequence per micro-batch: set "
-                    "log_prob_micro_batch_size_per_gpu=1 and ppo_micro_batch_size_per_gpu=1"
-                )
             if cu_seqlens is not None:
                 extra_kwargs["cu_seqlens"] = cu_seqlens
-            if extra_kwargs.get("attention_masks") is not None and not self.parallel_dims.cp_enabled:
-                # Kimi K3 builds its own masks from the [T] positions: current trees key them by
-                # consumer (a flex BlockMask for MLA, varlen offsets for KDA).
+            if extra_kwargs.get("attention_masks") is not None and hasattr(self.module[0], "get_attention_masks"):
+                # The model builds its own masks from the [T] positions: current trees key
+                # them by consumer (a flex BlockMask for MLA, varlen offsets for KDA).
                 positions = extra_inputs["positions"]
                 if positions.dim() == 2 and positions.shape[0] == 1:
                     positions = positions.squeeze(0)
