@@ -19,6 +19,7 @@ import importlib
 import itertools
 import contextlib
 import logging
+import inspect
 import math
 import sys
 import os
@@ -418,6 +419,9 @@ class TorchTitanEngine(BaseEngine):
 
         self._folded_token_stream = (
             type(self.trainer.model_parts[0]).preprocess_inputs is not BaseModel.preprocess_inputs
+        )
+        self._forward_takes_cu_seqlens = (
+            "cu_seqlens" in inspect.signature(type(self.trainer.model_parts[0]).forward).parameters
         )
 
         self._init_device_mesh()
@@ -1760,14 +1764,14 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             input_ids = local_inputs.unsqueeze(0)
             extra_inputs = {}
         elif self._folded_token_stream:
-            # Kimi K3's KDA and short convolution take the packed stream's
-            # document offsets explicitly under flex attention; a micro-batch
-            # here packs several sequences, and without them the recurrent
-            # state runs across sequences. A document starts where the
-            # positions restart at 0.
-            cu_seqlens = _cu_seqlens_from_positions(extra_inputs.get("positions"))
-            if cu_seqlens is not None:
-                extra_kwargs["cu_seqlens"] = cu_seqlens
+            # A model whose forward takes the packed stream's document offsets (KDA's
+            # recurrence and short convolution, which would otherwise run across the
+            # documents of a micro-batch) gets them explicitly; a document starts where
+            # the positions restart at 0.
+            if self._forward_takes_cu_seqlens:
+                cu_seqlens = _cu_seqlens_from_positions(extra_inputs.get("positions"))
+                if cu_seqlens is not None:
+                    extra_kwargs["cu_seqlens"] = cu_seqlens
             if extra_kwargs.get("attention_masks") is not None and hasattr(self.module[0], "get_attention_masks"):
                 # The model builds its own masks from the [T] positions: current trees key
                 # them by consumer (a flex BlockMask for MLA, varlen offsets for KDA).
