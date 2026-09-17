@@ -562,6 +562,9 @@ class TorchtitanEngineConfig(EngineConfig):
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )
+        assert self.context_parallel_backend in ["ulysses", "allgather_kv"], (
+            f"context_parallel_backend must be 'ulysses' or 'allgather_kv', got {self.context_parallel_backend!r}"
+        )
         assert self.spmd_backend in ["default", "full_dtensor", "spmd_types", "partial_dtensor"], (
             f"spmd_backend {self.spmd_backend} not supported"
         )
