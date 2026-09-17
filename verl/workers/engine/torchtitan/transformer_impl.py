@@ -326,6 +326,12 @@ class TorchTitanEngine(BaseEngine):
             if fn is None or not callable(fn):
                 raise
             model_spec = fn().model_spec
+        # The checkpoint decides whether the output head is tied to the embedding; a
+        # flavor derived by shape may say otherwise (Qwen3-0.6B ties, an untied copy of it
+        # carries lm_head.weight), and torchtitan refuses tying under pipeline parallel.
+        tied = getattr(self.model_config.hf_config, "tie_word_embeddings", None)
+        if tied is False and getattr(model_spec.model, "enable_weight_tying", False):
+            model_spec.model.enable_weight_tying = False
 
         optimizer = OptimizersContainer.Config(
             param_groups=[
