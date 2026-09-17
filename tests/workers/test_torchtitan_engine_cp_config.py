@@ -217,11 +217,12 @@ class TestMultimodalKwargs(unittest.TestCase):
 
         params = frozenset({"tokens", "pixel_values", "grid_thw", "special_tokens", "positions"})
         out = _model_multimodal_kwargs(
-            {"pixel_values": torch.zeros(4, 8), "grid_thws": torch.tensor([[1, 2, 2]]), "attention_mask": torch.ones(3)},
+            {"pixel_values": torch.zeros(4, 3, 2, 2), "grid_thws": torch.tensor([[1, 2, 2]]), "attention_mask": torch.ones(3)},
             params,
             163605,
         )
         self.assertEqual(set(out), {"pixel_values", "grid_thw", "special_tokens"})
+        self.assertEqual(tuple(out["pixel_values"].shape), (4, 12))
         self.assertEqual(out["special_tokens"], {"image_id": 163605})
         # a single-image micro-batch keeps grid_thw as [1, 3]; the stream folds
         folded = _squeeze_folded({"positions": torch.zeros(1, 7), **out})

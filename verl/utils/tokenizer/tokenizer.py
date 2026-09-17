@@ -127,11 +127,64 @@ def build_multimodal_processor_inputs(
         processor_kwargs.setdefault("video_metadata", video_metadata)
         processor_kwargs.setdefault("do_sample_frames", False)
 
+    if images and _processor_takes_medias(processor):
+        return _call_medias_processor(processor, text, images, processor_kwargs)
+
     processor_inputs = {"text": text, "images": images, "videos": videos, **processor_kwargs}
     if audio is not None:
         processor_inputs["audio"] = audio
 
     return processor(**processor_inputs)
+
+
+def _processor_takes_medias(processor) -> bool:
+    """Kimi K3's processor takes its images as ``medias`` and ignores ``images``."""
+    import inspect
+
+    try:
+        return "medias" in inspect.signature(processor.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_medias_processor(processor, text, images, processor_kwargs):
+    """Call a ``medias`` processor and expand its image placeholder to one pad per patch.
+
+    The processor emits one ``<|media_pad|>`` per image; the model wants as many as the
+    image has merged patches, the count the processor's own calculator gives (the vLLM
+    side expands the same way), so the pads are repeated here in ``input_ids`` and
+    ``attention_mask``.
+    """
+    import torch
+
+    if isinstance(text, (list, tuple)):
+        if len(text) != 1:
+            raise ValueError("a medias processor takes one prompt per call")
+        text = text[0]
+    medias = [{"type": "image", "image": image} for image in images]
+    out = processor(text=text, medias=medias, **processor_kwargs)
+    pad_id = processor.tokenizer.convert_tokens_to_ids("<|media_pad|>")
+    counts = [int(processor.media_processor.media_tokens_calculator(media)) for media in medias]
+    ids = out["input_ids"]
+    was_tensor = torch.is_tensor(ids)
+    row = ids[0].tolist() if was_tensor else list(ids[0] if isinstance(ids[0], (list, tuple)) else ids)
+    positions = [i for i, tok in enumerate(row) if tok == pad_id]
+    if len(positions) != len(counts):
+        raise ValueError(f"{len(positions)} image placeholders in the prompt for {len(counts)} images")
+    expanded: list[int] = []
+    last = 0
+    for pos, count in zip(positions, counts):
+        expanded.extend(row[last:pos])
+        expanded.extend([pad_id] * count)
+        last = pos + 1
+    expanded.extend(row[last:])
+    if was_tensor:
+        out["input_ids"] = torch.tensor([expanded], dtype=ids.dtype)
+        out["attention_mask"] = torch.ones(1, len(expanded), dtype=out["attention_mask"].dtype)
+    else:
+        out["input_ids"] = [expanded]
+        out["attention_mask"] = [[1] * len(expanded)]
+    return out
 
 
 def set_pad_token_id(tokenizer):
