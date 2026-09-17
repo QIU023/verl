@@ -457,9 +457,10 @@ class TorchTitanEngine(BaseEngine):
         self._folded_token_stream = (
             type(self.trainer.model_parts[0]).preprocess_inputs is not BaseModel.preprocess_inputs
         )
-        self._forward_takes_cu_seqlens = (
-            "cu_seqlens" in inspect.signature(type(self.trainer.model_parts[0]).forward).parameters
+        self._forward_params = frozenset(
+            inspect.signature(type(self.trainer.model_parts[0]).forward).parameters
         )
+        self._forward_takes_cu_seqlens = "cu_seqlens" in self._forward_params
 
         self._init_device_mesh()
 
@@ -681,10 +682,7 @@ class TorchTitanEngine(BaseEngine):
             input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
             if folded and input_ids.dim() == 2 and input_ids.shape[0] == 1:
                 input_ids = input_ids.squeeze(0)
-                extra_inputs = {
-                    k: (v.squeeze(0) if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == 1 else v)
-                    for k, v in extra_inputs.items()
-                }
+                extra_inputs = _squeeze_folded(extra_inputs)
             bridge.micro_batches[index] = micro_batch
             bridge.output_args[index] = output_args
             prepared.append((index, input_ids, {**extra_inputs, **extra_kwargs}))
@@ -747,10 +745,7 @@ class TorchTitanEngine(BaseEngine):
                 # Folded-stream decoders take [T] token streams; the
                 # rmpad path packs to [1, T]. Fold in, unfold the logits out.
                 squeezed_inputs = inputs.squeeze(0)
-                squeezed_extra = {
-                    k: (v.squeeze(0) if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == 1 else v)
-                    for k, v in (extra_inputs or {}).items()
-                }
+                squeezed_extra = _squeeze_folded(extra_inputs or {})
                 pred = model_parts[0](squeezed_inputs, **squeezed_extra, **extra_kwargs)
                 if pred.dim() == 2:
                     pred = pred.unsqueeze(0)
@@ -1383,6 +1378,41 @@ def _dynamo_probe_once() -> None:
     print("DYNAMO-PROBE " + " | ".join(lines), file=sys.stderr, flush=True)
 
 
+# Processor output names that differ from the model's forward parameters.
+_MULTIMODAL_KEY_ALIASES = {"grid_thws": "grid_thw", "image_grid_thw": "grid_thw"}
+# Multimodal tensors keep their own leading dimension (images, not the folded stream).
+_MULTIMODAL_KEYS = ("pixel_values", "grid_thw", "pixel_values_videos", "grid_thw_videos", "special_tokens")
+
+
+def _model_multimodal_kwargs(multi_modal_inputs: dict, forward_params, placeholder_id) -> dict:
+    """The processor's multimodal outputs as the model's forward keyword arguments.
+
+    Renames the processor's spellings, keeps only what the forward takes, and adds the
+    placeholder token the model looks for (``special_tokens={"image_id": ...}``) when
+    images are present.
+    """
+    out = {}
+    for key, value in multi_modal_inputs.items():
+        name = _MULTIMODAL_KEY_ALIASES.get(key, key)
+        if name in forward_params:
+            out[name] = value
+    if "pixel_values" in out and "special_tokens" in forward_params and placeholder_id is not None:
+        out["special_tokens"] = {"image_id": int(placeholder_id)}
+    return out
+
+
+def _squeeze_folded(extra: dict) -> dict:
+    """Fold ``[1, T]`` stream tensors to ``[T]``; multimodal tensors keep their batch axis."""
+    return {
+        k: (
+            v.squeeze(0)
+            if k not in _MULTIMODAL_KEYS and torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == 1
+            else v
+        )
+        for k, v in extra.items()
+    }
+
+
 def _cu_seqlens_from_positions(positions):
     """Packed offsets ``[0, ..., T]`` of a folded ``[T]`` (or ``[1, T]``) stream from its
     positions: a document starts where the position restarts at 0. ``None`` without an
@@ -1685,6 +1715,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
+        model_mm_kwargs = _model_multimodal_kwargs(
+            multi_modal_inputs,
+            self._forward_params,
+            getattr(self.model_config.hf_config, "media_placeholder_token_id", None),
+        )
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
         output_args = {}
@@ -1833,6 +1868,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 "labels": labels.squeeze(0),
                 "positions": position_ids.squeeze(0),
             }
+            # Images ride through the model's preprocessing, which builds their bank
+            # indices and shards them with the stream; they are not added again below.
+            batch.update(model_mm_kwargs)
+            model_mm_kwargs = {}
             local_inputs, _labels_local, extra_kwargs = self.module[0].preprocess_inputs(
                 batch,
                 parallel_dims=self.parallel_dims,
@@ -1857,8 +1896,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     positions = positions.squeeze(0)
                 extra_kwargs["attention_masks"] = self.module[0].get_attention_masks(positions=positions)
 
-        # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
-        extra_inputs.update(multi_modal_inputs)
+        extra_inputs.update(model_mm_kwargs)
         output_args["labels"] = labels
         output_args["cp_pad_len"] = cp_pad_len
         return input_ids, extra_inputs, extra_kwargs, output_args
