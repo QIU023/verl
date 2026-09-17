@@ -1384,6 +1384,28 @@ _MULTIMODAL_KEY_ALIASES = {"grid_thws": "grid_thw", "image_grid_thw": "grid_thw"
 _MULTIMODAL_KEYS = ("pixel_values", "grid_thw", "pixel_values_videos", "grid_thw_videos", "special_tokens")
 
 
+def pipeline_token_budget(configured: int | None, tokens: int) -> int:
+    """The fixed per-micro-batch token count pipeline parallelism pads to.
+
+    The config field wins; ``VERL_PP_TOKEN_BUDGET`` is the fallback, so a run can set it
+    without a config edit. Both refusals name the knob, since a stage sizes its P2P
+    buffers from the first micro-batch and a later one of another length deadlocks.
+    """
+    budget = int(configured or os.environ.get("VERL_PP_TOKEN_BUDGET", "0"))
+    if budget <= 0:
+        raise ValueError(
+            "pipeline parallelism needs a fixed token count per micro-batch; set "
+            "torchtitan.pipeline_token_budget (or VERL_PP_TOKEN_BUDGET) to at least "
+            "the largest packed micro-batch"
+        )
+    if tokens > budget:
+        raise ValueError(
+            f"micro-batch of {tokens} tokens exceeds the pipeline token budget {budget}; "
+            "raise the budget or lower the micro-batch size"
+        )
+    return budget
+
+
 def _model_multimodal_kwargs(multi_modal_inputs: dict, forward_params, placeholder_id) -> dict:
     """The processor's multimodal outputs as the model's forward keyword arguments.
 
@@ -1777,21 +1799,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             # count. Pad the packed stream to a fixed budget before any CP
             # split: positions continue the stream, the mask is rebuilt, and
             # the bridge cuts the logits back before the loss.
-            budget = int(
-                self.engine_config.pipeline_token_budget
-                or os.environ.get("VERL_PP_TOKEN_BUDGET", "0")
-            )
-            if budget <= 0:
-                raise ValueError(
-                    "pipeline parallelism needs a fixed token count per micro-batch; "
-                    "set VERL_PP_TOKEN_BUDGET to at least the largest packed micro-batch"
-                )
             tokens = input_ids.shape[-1]
-            if tokens > budget:
-                raise ValueError(
-                    f"micro-batch of {tokens} tokens exceeds VERL_PP_TOKEN_BUDGET={budget}; "
-                    "raise the budget or lower the micro-batch size"
-                )
+            budget = pipeline_token_budget(self.engine_config.pipeline_token_budget, tokens)
             pp_pad_len = budget - tokens
             if pp_pad_len:
                 pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
