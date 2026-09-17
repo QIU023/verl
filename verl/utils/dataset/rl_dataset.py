@@ -518,11 +518,18 @@ class RLHFDataset(Dataset):
             for message in messages
         )
         if has_visual:
-            from qwen_vl_utils import process_vision_info
-
-            images, videos = process_vision_info(
-                messages, image_patch_size=image_patch_size, return_video_metadata=True
-            )
+            try:
+                from qwen_vl_utils import process_vision_info
+            except ImportError:
+                # Without qwen_vl_utils the images in the messages are taken as they are
+                # (PIL, a path, or bytes); the model's own processor resizes them.
+                process_vision_info = None
+            if process_vision_info is None:
+                images, videos = _images_from_messages(messages) or None, None
+            else:
+                images, videos = process_vision_info(
+                    messages, image_patch_size=image_patch_size, return_video_metadata=True
+                )
         else:
             images, videos = None, None
         audios = cls._extract_audio_info(messages)
