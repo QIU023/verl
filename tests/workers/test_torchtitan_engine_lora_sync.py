@@ -45,7 +45,8 @@ def _helper():
     src = pathlib.Path(
         "verl/workers/engine/torchtitan/transformer_impl.py"
     ).read_text()
-    start = src.index("def _merged_state_dict_if_lora")
+    # from the wrapper discovery on, so the helpers the transform calls come along
+    start = src.index("def _titan_lora_wrappers")
     end = src.index("class EngineEvalModeCtx")
     ns = {
         "logger": types.SimpleNamespace(

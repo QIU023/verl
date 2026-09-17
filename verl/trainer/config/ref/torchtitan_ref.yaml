@@ -27,5 +27,6 @@ torchtitan:
   context_parallel_backend: ${oc.select:actor_rollout_ref.actor.torchtitan.context_parallel_backend,ulysses}
   sequence_parallel: ${oc.select:actor_rollout_ref.actor.torchtitan.sequence_parallel,true}
   initial_load_path: ${oc.select:actor_rollout_ref.actor.torchtitan.initial_load_path,null}
+  pipeline_token_budget: ${oc.select:actor_rollout_ref.actor.torchtitan.pipeline_token_budget,null}
   attn_type: ${oc.select:actor_rollout_ref.actor.torchtitan.attn_type,flex}
   forward_only: True
