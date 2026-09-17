@@ -62,6 +62,8 @@ from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
     build_multimodal_processor_inputs,
     get_processor_token_id,
+    media_features,
+    processor_takes_medias,
 )
 from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
 from verl.workers.config import (
@@ -875,6 +877,9 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
+        if processor_takes_medias(self.processor):
+            # The prompt ids already carry the expanded pads; the features come from the images.
+            return media_features(self.processor, images)
         # Collapse expanded vision placeholder runs back to a single placeholder
         # per media item before decoding, so the processor re-expands cleanly.
         # ``input_ids`` already contains fully expanded image/video pad tokens; if

@@ -127,7 +127,7 @@ def build_multimodal_processor_inputs(
         processor_kwargs.setdefault("video_metadata", video_metadata)
         processor_kwargs.setdefault("do_sample_frames", False)
 
-    if images and _processor_takes_medias(processor):
+    if images and processor_takes_medias(processor):
         return _call_medias_processor(processor, text, images, processor_kwargs)
 
     processor_inputs = {"text": text, "images": images, "videos": videos, **processor_kwargs}
@@ -137,7 +137,7 @@ def build_multimodal_processor_inputs(
     return processor(**processor_inputs)
 
 
-def _processor_takes_medias(processor) -> bool:
+def processor_takes_medias(processor) -> bool:
     """Kimi K3's processor takes its images as ``medias`` and ignores ``images``."""
     import inspect
 
@@ -163,7 +163,7 @@ def _call_medias_processor(processor, text, images, processor_kwargs):
         text = text[0]
     medias = [{"type": "image", "image": image} for image in images]
     out = processor(text=text, medias=medias, **processor_kwargs)
-    pad_id = processor.tokenizer.convert_tokens_to_ids("<|media_pad|>")
+    pad_id = media_pad_token_id(processor)
     counts = [int(processor.media_processor.media_tokens_calculator(media)) for media in medias]
     ids = out["input_ids"]
     was_tensor = torch.is_tensor(ids)
@@ -184,6 +184,54 @@ def _call_medias_processor(processor, text, images, processor_kwargs):
     else:
         out["input_ids"] = [expanded]
         out["attention_mask"] = [[1] * len(expanded)]
+    return out
+
+
+_MEDIA_PAD = "<|media_pad|>"
+
+
+def media_pad_token_id(processor) -> int | None:
+    """The pad a ``medias`` processor expands per image patch, None for other processors."""
+    if not processor_takes_medias(processor):
+        return None
+    return int(processor.tokenizer.convert_tokens_to_ids(_MEDIA_PAD))
+
+
+def media_features(processor, images) -> dict:
+    """The vision tensors of a ``medias`` processor for ``images`` alone, without a prompt."""
+    if not images:
+        return {}
+    medias = [{"type": "image", "image": image} for image in images]
+    return dict(processor.media_processor.preprocess(medias, return_tensors="pt").data)
+
+
+def collapse_media_blocks(prompt_ids: list[int], processor) -> list[int]:
+    """Fold each expanded media block back into the image placeholder the rollout engine expands.
+
+    The training stream spells an image as ``<|media_begin|>`` ... ``<|media_content|>``, the pads,
+    ``<|media_end|>``; vLLM's Kimi K3 processor writes that block itself from the placeholder, so the
+    rollout prompt carries the placeholder in its own token spelling.
+    """
+    if not processor_takes_medias(processor):
+        return prompt_ids
+    tokenizer = processor.tokenizer
+    begin = tokenizer.convert_tokens_to_ids("<|media_begin|>")
+    end = tokenizer.convert_tokens_to_ids("<|media_end|>")
+    placeholder = tokenizer.encode(processor.image_placeholder, add_special_tokens=False)
+    out: list[int] = []
+    i = 0
+    while i < len(prompt_ids):
+        if prompt_ids[i] != begin:
+            out.append(prompt_ids[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(prompt_ids) and prompt_ids[j] != end:
+            j += 1
+        if j == len(prompt_ids):
+            raise ValueError("a media block opens without <|media_end|>")
+        out.extend(placeholder)
+        i = j + 1
     return out
 
 

@@ -21,7 +21,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI
 
-from verl.utils.tokenizer import get_processor_token_id
+from verl.utils.tokenizer import get_processor_token_id, media_pad_token_id
 from verl.workers.config.rollout import PrometheusConfig
 
 logger = logging.getLogger(__file__)
@@ -135,6 +135,9 @@ def get_vision_placeholder_token_ids(processor) -> list[int]:
         token_id = get_processor_token_id(processor, modality)
         if token_id is not None:
             token_ids.append(token_id)
+    pad_id = media_pad_token_id(processor)
+    if pad_id is not None:
+        token_ids.append(pad_id)
     return token_ids
 
 

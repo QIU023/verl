@@ -14,10 +14,14 @@
 
 from .tokenizer import (
     build_multimodal_processor_inputs,
+    collapse_media_blocks,
     get_processor_token_id,
     hf_processor,
     hf_tokenizer,
+    media_features,
+    media_pad_token_id,
     normalize_token_ids,
+    processor_takes_medias,
 )
 
 __all__ = [
@@ -26,4 +30,8 @@ __all__ = [
     "normalize_token_ids",
     "build_multimodal_processor_inputs",
     "get_processor_token_id",
+    "processor_takes_medias",
+    "media_pad_token_id",
+    "media_features",
+    "collapse_media_blocks",
 ]

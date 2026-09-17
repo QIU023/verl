@@ -25,10 +25,10 @@ class TestKimiK3ProcessorInputs(unittest.TestCase):
         from PIL import Image
         from transformers import AutoProcessor
 
-        from verl.utils.tokenizer.tokenizer import _processor_takes_medias, build_multimodal_processor_inputs
+        from verl.utils.tokenizer.tokenizer import processor_takes_medias, build_multimodal_processor_inputs
 
         processor = AutoProcessor.from_pretrained(K3_EXPORT, trust_remote_code=True)
-        self.assertTrue(_processor_takes_medias(processor))
+        self.assertTrue(processor_takes_medias(processor))
         image = Image.new("RGB", (64, 48), (200, 30, 30))
         expected = int(processor.media_processor.media_tokens_calculator({"type": "image", "image": image}))
         out = build_multimodal_processor_inputs(
@@ -40,6 +40,54 @@ class TestKimiK3ProcessorInputs(unittest.TestCase):
         self.assertEqual(out["attention_mask"].shape[-1], len(ids))
         self.assertIn("pixel_values", out)
         self.assertEqual(int(out["grid_thws"][0].prod()), out["pixel_values"].shape[0])
+
+
+    def test_generic_vl_builder_expands_the_pads_and_the_rollout_collapse_restores_the_placeholder(self):
+        from PIL import Image
+        from transformers import AutoProcessor, AutoTokenizer
+
+        from verl.utils.tokenizer import collapse_media_blocks, normalize_token_ids
+        from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
+
+        tokenizer = AutoTokenizer.from_pretrained(K3_EXPORT, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(K3_EXPORT, trust_remote_code=True)
+        builder = create_continuous_token_builder(tokenizer, hf_model_type="kimi_k3", processor=processor)
+        image = Image.new("RGB", (84, 56), (10, 200, 30))
+        messages = [
+            {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "What colour?"}]}
+        ]
+        ids = builder.build_initial_tokens(messages, images=[image])
+        pad = processor.tokenizer.convert_tokens_to_ids("<|media_pad|>")
+        expected = int(processor.media_processor.media_tokens_calculator({"type": "image", "image": image}))
+        self.assertEqual(ids.count(pad), expected)
+        rollout_ids = collapse_media_blocks(ids, processor)
+        template_ids = normalize_token_ids(
+            tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        )
+        self.assertEqual(rollout_ids, template_ids)
+        self.assertNotIn(pad, rollout_ids)
+        text_only = [{"role": "user", "content": "hello"}]
+        self.assertEqual(
+            builder.build_initial_tokens(text_only),
+            normalize_token_ids(tokenizer.apply_chat_template(text_only, tokenize=True, add_generation_prompt=True)),
+        )
+
+    def test_media_features_match_the_prompt_call_and_the_pad_is_banned(self):
+        import torch
+        from PIL import Image
+        from transformers import AutoProcessor
+
+        from verl.utils.tokenizer import build_multimodal_processor_inputs, media_features, media_pad_token_id
+        from verl.workers.rollout.utils import get_vision_placeholder_token_ids
+
+        processor = AutoProcessor.from_pretrained(K3_EXPORT, trust_remote_code=True)
+        image = Image.new("RGB", (70, 42), (0, 0, 250))
+        features = media_features(processor, [image])
+        out = build_multimodal_processor_inputs(processor, text="<|kimi_image_placeholder|> x", images=[image])
+        self.assertTrue(torch.equal(features["pixel_values"], out["pixel_values"]))
+        self.assertTrue(torch.equal(features["grid_thws"], out["grid_thws"]))
+        self.assertEqual(media_features(processor, []), {})
+        self.assertEqual(get_vision_placeholder_token_ids(processor), [media_pad_token_id(processor)])
 
 
 class TestImagesFromMessages(unittest.TestCase):
