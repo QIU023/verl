@@ -1172,6 +1172,11 @@ class TorchTitanEngine(BaseEngine):
             if adapter_mode:
                 hf_names = _wrapped_hf_base_names(sd_adapter, wrappers, params)
             params = sd_adapter.to_hf(params)
+        elif adapter_mode:
+            raise ValueError(
+                "adapter-only weight sync needs the state-dict adapter to name the "
+                "wrapped projections; none is configured"
+            )
 
         # DIAGNOSTIC (KIMI_GRPO_DUMP_SYNC): the same tensors after to_hf, as the rollout receives them.
         if dump_dir and not getattr(self, "_sync_dumped_hf", False):
@@ -1184,11 +1189,6 @@ class TorchTitanEngine(BaseEngine):
             if torch.distributed.get_rank() == 0:
                 torch.save(full, _os.path.join(dump_dir, "sync_step1_hf.pt"))
                 print(f"KIMI_GRPO_DUMP_SYNC: wrote {len(full)} HF-named tensors", file=sys.stderr, flush=True)
-        elif adapter_mode:
-            raise ValueError(
-                "adapter-only weight sync needs the state-dict adapter to name the "
-                "wrapped projections; none is configured"
-            )
 
         if adapter_mode:
             if base_sync_done:
@@ -1621,11 +1621,6 @@ def _merged_state_dict_if_lora(module):
     drops everything LoRA learned. Under LoRA the base is frozen, so the rollout
     engine would then receive the same weights at every step -- indistinguishable
     from a broken sync, and the actor would train adapters the rollout never sees.
-
-    Measured on kimi_k3_debugmodel_gated_lora: with lora_b at its zero init the two
-    paths agree (LoRA is identity at step 0, so that is correct); with lora_b set to
-    0.01 the merged path changes and the raw path does not. Key sets are identical
-    either way, 151 both, so this is a drop-in for the sync.
 
     Non-LoRA models take the plain path -- the import and the scan are both skipped
     unless a wrapper is actually present.
