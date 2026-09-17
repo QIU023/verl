@@ -114,3 +114,19 @@ class TestImagesFromMessages(unittest.TestCase):
         ]
         images = _images_from_messages(messages)
         self.assertEqual([im.size for im in images], [(32, 24), (32, 24)])
+
+    def test_multi_modal_info_falls_back_without_qwen_vl_utils(self):
+        import sys
+        from unittest import mock
+
+        from PIL import Image
+
+        from verl.utils.dataset.rl_dataset import RLHFDataset
+
+        image = Image.new("RGB", (28, 14), (9, 9, 9))
+        messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "?"}]}]
+        with mock.patch.dict(sys.modules, {"qwen_vl_utils": None}):
+            images, videos, audios = RLHFDataset._process_multi_modal_info(messages, image_patch_size=14, config=None)
+        self.assertEqual([im.size for im in images], [(28, 14)])
+        self.assertIsNone(videos)
+        self.assertIsNone(audios)
