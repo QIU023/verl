@@ -93,6 +93,29 @@ def _parallelism_compat_kwargs(spmd_backend: str, cp_enabled: bool) -> dict:
     return kwargs
 
 
+def _lora_transform(model_config):
+    """torchtitan's ``LoRATransform`` from ``model.lora`` when it names a rank, else None.
+
+    ``target_modules`` are torchtitan's projection names (``wq``, ``wo``, ``w2``, ...);
+    the transform warns when none matches.
+    """
+    lora_cfg = getattr(model_config, "lora", None)
+    if lora_cfg is not None and not isinstance(lora_cfg, dict):
+        lora_cfg = dict(vars(lora_cfg))
+    rank = int((lora_cfg or {}).get("rank", 0) or 0)
+    if rank <= 0:
+        return None
+    from torchtitan.config.transform import LinearLoRAHandler, LoRATransform
+
+    targets = lora_cfg.get("target_modules")
+    return LoRATransform(
+        handlers=(LinearLoRAHandler(),),
+        rank=rank,
+        alpha=float(lora_cfg.get("alpha", 2 * rank)),
+        target_modules=list(targets) if targets else None,
+    )
+
+
 def _context_parallel_transform(model_config, backend: str) -> ContextParallelTransform:
     """The CP backends for the inner attentions this model config carries.
 
@@ -399,18 +422,24 @@ class TorchTitanEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
+        transforms = []
         if self.engine_config.context_parallel_size > 1:
             # As torchtitan's own CP recipes do: raise the degree on the built config, then
             # apply the transform, whose validated copy pairs the degree with the backends.
             self.config.parallelism.context_parallel_degree = self.engine_config.context_parallel_size
-            self.config = apply_transforms(
-                self.config,
-                [
-                    _context_parallel_transform(
-                        self.config.model_spec.model, self.engine_config.context_parallel_backend
-                    )
-                ],
+            transforms.append(
+                _context_parallel_transform(
+                    self.config.model_spec.model, self.engine_config.context_parallel_backend
+                )
             )
+        lora_transform = _lora_transform(self.model_config)
+        if lora_transform is not None:
+            # model.lora with a rank adapts through torchtitan's own transform (ordered after
+            # the CP transform by apply_transforms); a flavor that already carries LoRA keeps
+            # model.lora at rank 0.
+            transforms.append(lora_transform)
+        if transforms:
+            self.config = apply_transforms(self.config, transforms)
         with _fp32_matmul_emulation_optional():
             self.trainer = Trainer(self.config)
         # Decoders on torchtitan main take a folded [T] token stream and own their input
@@ -1316,6 +1345,36 @@ def _guard_fsdp_grad_upcast() -> None:
     FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
+_DYNAMO_PROBED = False
+
+
+def _dynamo_probe_once() -> None:
+    """DIAGNOSTIC (VERL_TORCHTITAN_DYNAMO_PROBE): why the worker cannot torch.compile."""
+    global _DYNAMO_PROBED
+    if _DYNAMO_PROBED:
+        return
+    _DYNAMO_PROBED = True
+    import sys
+    import threading
+
+    import torch._dynamo
+
+    lines = [
+        f"dynamo.config.disable={torch._dynamo.config.disable}",
+        f"suppress_errors={torch._dynamo.config.suppress_errors}",
+        f"is_dynamo_supported={torch.compiler.is_dynamo_supported()}",
+        f"thread={threading.current_thread().name} main={threading.current_thread() is threading.main_thread()}",
+        f"TORCHDYNAMO_DISABLE={os.environ.get('TORCHDYNAMO_DISABLE')} TORCH_COMPILE_DISABLE={os.environ.get('TORCH_COMPILE_DISABLE')}",
+    ]
+    try:
+        fn = torch.compile(lambda x: x + 1, fullgraph=True)
+        fn(torch.ones(1, device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu"))
+        lines.append("trivial fullgraph compile: ok")
+    except Exception as err:  # noqa: BLE001
+        lines.append(f"trivial fullgraph compile FAILED: {type(err).__name__}: {str(err)[:200]}")
+    print("DYNAMO-PROBE " + " | ".join(lines), file=sys.stderr, flush=True)
+
+
 def _cu_seqlens_from_positions(positions):
     """Packed offsets ``[0, ..., T]`` of a folded ``[T]`` (or ``[1, T]``) stream from its
     positions: a document starts where the position restarts at 0. ``None`` without an
@@ -1351,14 +1410,24 @@ def _titan_lora_wrappers(module):
 
 
 def _is_lora_wrapper(sub) -> bool:
-    """torchtitan core's LoRA linear (``LoRALinearBase``: the base ``weight`` on the
-    module, ``lora_a`` / ``lora_b`` as Linear submodules) or the earlier model-local
-    wrapper (``base`` submodule, adapter tensors as parameters)."""
+    """A LoRA linear: torchtitan main's ``_LoRALinearMixin`` (``specialize_lora_linear``),
+    the fork's ``LoRALinearBase`` (the base ``weight`` on the module, ``lora_a`` /
+    ``lora_b`` as Linear submodules, optionally a packed base), or the earlier
+    model-local wrapper (``base`` submodule, adapter tensors as parameters)."""
+    markers: tuple = ()
     try:
         from torchtitan.config.transform.lora import LoRALinearBase
-    except ImportError:  # pragma: no cover - trees without core LoRA
-        LoRALinearBase = ()
-    if LoRALinearBase and isinstance(sub, LoRALinearBase):
+
+        markers += (LoRALinearBase,)
+    except ImportError:  # pragma: no cover - trees without the fork's LoRA
+        pass
+    try:
+        from torchtitan.models.common.lora import _LoRALinearMixin
+
+        markers += (_LoRALinearMixin,)
+    except ImportError:  # pragma: no cover - trees before main's LoRA transform
+        pass
+    if markers and isinstance(sub, markers):
         return True
     return hasattr(sub, "lora_a") and hasattr(sub, "lora_b") and hasattr(sub, "base")
 
@@ -1523,12 +1592,7 @@ def _merged_state_dict_if_lora(module):
         from torchtitan.config.transform.lora import LoRALinearBase
     except ImportError:  # pragma: no cover
         LoRALinearBase = ()
-    wrappers = {
-        name: m
-        for name, m in module.named_modules()
-        if (LoRALinearBase and isinstance(m, LoRALinearBase))
-        or (hasattr(m, "lora_a") and hasattr(m, "lora_b") and hasattr(m, "base"))
-    }
+    wrappers = {name: m for name, m in module.named_modules() if _is_lora_wrapper(m)}
     if not wrappers:
         return module.state_dict(), frozenset()
     from torchtitan.config.transform.lora import merge_lora_state_dict
@@ -1671,7 +1735,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             # count. Pad the packed stream to a fixed budget before any CP
             # split: positions continue the stream, the mask is rebuilt, and
             # the bridge cuts the logits back before the loss.
-            budget = int(os.environ.get("VERL_PP_TOKEN_BUDGET", "0"))
+            budget = int(
+                self.engine_config.pipeline_token_budget
+                or os.environ.get("VERL_PP_TOKEN_BUDGET", "0")
+            )
             if budget <= 0:
                 raise ValueError(
                     "pipeline parallelism needs a fixed token count per micro-batch; "
@@ -1741,6 +1808,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                         attn_type=self.engine_config.attn_type,
                     )
                     extra_kwargs["attention_masks"] = attention_mask
+        if self.parallel_dims.cp_enabled and os.environ.get("VERL_TORCHTITAN_DYNAMO_PROBE"):
+            _dynamo_probe_once()
         if self.parallel_dims.cp_enabled:
             # The model owns its context-parallel preprocessing on this tree: the masks
             # from the positions, the shards, the KDA routing and the layouts. Hand it

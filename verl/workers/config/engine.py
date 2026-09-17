@@ -505,6 +505,8 @@ class TorchtitanEngineConfig(EngineConfig):
         context_parallel_backend (str): the CP backend for flex attention, "ulysses" (default; masks
             stay global) or "allgather_kv" (the flex BlockMask is sharded per rank)
         sequence_parallel (bool): sequence parallel on the tensor-parallel axis, default True
+        pipeline_token_budget (int | None): under pipeline parallelism every micro-batch is padded to this
+            many tokens so the stages size their buffers once; at least the largest packed micro-batch
         initial_load_path (str | None): a torchtitan DCP checkpoint to start the trainer from instead
             of the HF weights at model.path (a packed-MXFP4 QLoRA model has no HF spelling for its
             bases); model.path still serves the rollout engine
@@ -546,6 +548,7 @@ class TorchtitanEngineConfig(EngineConfig):
     context_parallel_backend: str = "ulysses"
     sequence_parallel: bool = True
     initial_load_path: Optional[str] = None
+    pipeline_token_budget: Optional[int] = None
     attn_type: str = "flex"
     spmd_backend: str = "spmd_types"
     activation_checkpoint: str = "selective"
