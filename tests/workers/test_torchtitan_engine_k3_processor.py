@@ -40,3 +40,29 @@ class TestKimiK3ProcessorInputs(unittest.TestCase):
         self.assertEqual(out["attention_mask"].shape[-1], len(ids))
         self.assertIn("pixel_values", out)
         self.assertEqual(int(out["grid_thws"][0].prod()), out["pixel_values"].shape[0])
+
+
+class TestImagesFromMessages(unittest.TestCase):
+    def test_bytes_path_and_pil_blocks_become_pil_images(self):
+        import io
+
+        from PIL import Image
+
+        from verl.utils.dataset.rl_dataset import _images_from_messages
+
+        image = Image.new("RGB", (32, 24), (1, 2, 3))
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        messages = [
+            {"role": "system", "content": "text only"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": {"bytes": buf.getvalue()}},
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": "what is this"},
+                ],
+            },
+        ]
+        images = _images_from_messages(messages)
+        self.assertEqual([im.size for im in images], [(32, 24), (32, 24)])
