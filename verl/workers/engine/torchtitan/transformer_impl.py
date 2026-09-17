@@ -376,14 +376,14 @@ class TorchTitanEngine(BaseEngine):
                 self.engine_config.spmd_backend, self.engine_config.context_parallel_size > 1
             ),
         )
-        # A torchtitan DCP checkpoint takes precedence over the HF weights at model.path: a
-        # model whose frozen bases are packed (QLoRA) has no HF spelling for them.
-        dcp_path = self.engine_config.initial_load_path
+        load_in_hf, load_path = initial_checkpoint_source(
+            self.engine_config.initial_load_path, model_config.path
+        )
         checkpoint = CheckpointManager.Config(
             enable=True,
-            initial_load_in_hf=dcp_path is None,
+            initial_load_in_hf=load_in_hf,
             initial_load_model_only=True,
-            initial_load_path=dcp_path or model_config.path,
+            initial_load_path=load_path,
             # verl's trainer.save_freq is the cadence authority and save() is
             # only called on those steps; defer torchtitan's own interval to 1
             # so every requested save writes (default 500 silently drops all
@@ -1382,6 +1382,15 @@ def _dynamo_probe_once() -> None:
 _MULTIMODAL_KEY_ALIASES = {"grid_thws": "grid_thw", "image_grid_thw": "grid_thw"}
 # Multimodal tensors keep their own leading dimension (images, not the folded stream).
 _MULTIMODAL_KEYS = ("pixel_values", "grid_thw", "pixel_values_videos", "grid_thw_videos", "special_tokens")
+
+
+def initial_checkpoint_source(initial_load_path: str | None, model_path: str) -> tuple[bool, str]:
+    """Where the first load comes from: ``(load_in_hf, path)``.
+
+    A torchtitan DCP checkpoint takes precedence over the HF weights at ``model.path``,
+    since a model whose frozen bases are packed (QLoRA) has no HF spelling for them.
+    """
+    return initial_load_path is None, initial_load_path or model_path
 
 
 def pipeline_token_budget(configured: int | None, tokens: int) -> int:
