@@ -1396,6 +1396,10 @@ def _model_multimodal_kwargs(multi_modal_inputs: dict, forward_params, placehold
         name = _MULTIMODAL_KEY_ALIASES.get(key, key)
         if name in forward_params:
             out[name] = value
+    pixel_values = out.get("pixel_values")
+    if torch.is_tensor(pixel_values) and pixel_values.dim() == 4:
+        # the processor's [patches, C, p, p]; the model takes [patches, C * p * p]
+        out["pixel_values"] = pixel_values.flatten(1)
     if "pixel_values" in out and "special_tokens" in forward_params and placeholder_id is not None:
         out["special_tokens"] = {"image_id": int(placeholder_id)}
     return out
