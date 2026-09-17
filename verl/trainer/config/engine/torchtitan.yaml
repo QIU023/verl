@@ -58,6 +58,15 @@ pipeline_parallel_size: 1
 # Context parallel size
 context_parallel_size: 1
 
+# CP backend for flex attention: "ulysses" (masks stay global) or "allgather_kv"
+context_parallel_backend: ulysses
+
+# Sequence parallel on the tensor-parallel axis
+sequence_parallel: true
+
+# A torchtitan DCP checkpoint to start the trainer from instead of the HF weights at model.path
+initial_load_path: null
+
 # Attention type for torchtitan's model (e.g., "sdpa", "flex", "varlen")
 attn_type: flex
 
