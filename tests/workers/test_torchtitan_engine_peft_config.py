@@ -72,11 +72,8 @@ class _Model(nn.Module):
 class _FakeAdapter:
     """Minimal stand-in for the state-dict adapter's naming contract."""
 
-    def _is_text_only(self, state_dict):
-        return True
-
-    def _tt_key_to_hf(self, key, text_only=False):
-        return f"model.{key}"
+    def to_hf(self, state_dict):
+        return {f"model.{key}": value for key, value in state_dict.items()}
 
 
 def _sd(*fqns, wrapper: str | None = None):

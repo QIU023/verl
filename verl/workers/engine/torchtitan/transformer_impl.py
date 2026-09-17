@@ -1423,32 +1423,32 @@ def _peft_config_from_wrappers(wrappers):
 def _wrapped_hf_base_names(sd_adapter, wrappers, full_state_dict):
     """``{fqn: hf_name}`` for each wrapped projection's BASE weight.
 
-    Uses the adapter's own key mapping rather than reimplementing it -- the vision /
-    text prefixing, the official-export renames and the ``.base.weight`` stripping all
-    live there, and a second copy of that logic is how the two drift apart. ``to_hf``
-    decides text-vs-multimodal from the WHOLE state dict, so ``_is_text_only`` is asked
-    once against the full dict; calling ``to_hf`` per key would let a one-entry dict
-    misclassify it and silently emit the wrong prefix.
+    Uses the adapter's own ``to_hf`` on the base key alone rather than reimplementing
+    its mapping (the official-export renames live there). ``to_hf`` drops every
+    ``lora_a`` / ``lora_b`` key by design, so the adapters cannot ride through it.
 
-    ``to_hf`` itself cannot carry the adapters: it drops every ``lora_a`` / ``lora_b``
-    key by design, because the HF key space is the original Kimi architecture.
+    The fqns come from named_modules(), which KEEPS wrapper segments that state_dict()
+    strips (``layers.0._checkpoint_wrapped_module.ffn.gate_proj`` under activation
+    checkpointing); _lora_prefix validates the stripped name against the state dict.
+    A packed (QLoRA) base has no ``.weight`` and no HF key: adapter-only sync needs the
+    merged path there (model.lora.merge=True).
     """
-    text_only = sd_adapter._is_text_only(full_state_dict)
-    # The fqns come from named_modules(), which KEEPS wrapper segments that state_dict()
-    # strips: under activation checkpointing `layers.0.ffn.gate_proj` is
-    # `layers.0._checkpoint_wrapped_module.ffn.gate_proj` there. Composing a key from the
-    # module path then hands to_hf a name it has no mapping for --
-    #   ValueError: Unmapped tt key:
-    #   'layers.0._checkpoint_wrapped_module.ffn.gate_proj.weight'
-    # which is exactly the failure merge_lora_state_dict already hit from the same
-    # direction. _state_dict_prefix is that fix; reusing it keeps one source of truth and
-    # makes it VALIDATE against the state dict instead of guessing a stripped name.
-    return {
-        fqn: sd_adapter._tt_key_to_hf(
-            f"{_lora_prefix(fqn, full_state_dict)}.weight", text_only
-        )
-        for fqn in wrappers
-    }
+    names = {}
+    for fqn in wrappers:
+        key = f"{_lora_prefix(fqn, full_state_dict)}.weight"
+        if key not in full_state_dict:
+            raise ValueError(
+                f"{fqn}: no base weight {key!r} in the state dict; a packed base takes the "
+                "merged sync (model.lora.merge=True)"
+            )
+        mapped = sd_adapter.to_hf({key: full_state_dict[key]})
+        if len(mapped) != 1:
+            raise ValueError(
+                f"{key} maps to {sorted(mapped)} in the HF key space; the adapter-only "
+                "sync needs one base key per wrapped projection"
+            )
+        names[fqn] = next(iter(mapped))
+    return names
 
 
 def _adapter_state_dict(wrappers, hf_names):
