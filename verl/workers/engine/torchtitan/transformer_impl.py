@@ -135,6 +135,8 @@ def _context_parallel_transform(model_config, backend: str) -> ContextParallelTr
     flex_backends = {"ulysses": UlyssesCPFlexInnerAttention, "allgather_kv": KVAllGatherCPFlexInnerAttention}
     if backend not in flex_backends:
         raise ValueError(f"context_parallel_backend must be one of {sorted(flex_backends)}, got {backend!r}")
+    if not any(True for _ in model_config.traverse(FlexInnerAttention.Config)):
+        raise ValueError("context parallel needs attn_type 'flex': the CP backends are flex based")
     mapping: dict = {FlexInnerAttention.Config: flex_backends[backend]}
     try:
         from torchtitan.models.kimi_k3.cp_kda import ContextParallelInnerKDA
