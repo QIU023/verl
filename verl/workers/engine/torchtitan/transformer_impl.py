@@ -1351,6 +1351,34 @@ def _guard_fsdp_grad_upcast() -> None:
 _DYNAMO_PROBED = False
 
 
+def _probe_compile_here() -> str:
+    """Can dynamo compile at this exact point in the worker, and can it compile the
+    function torch's context-parallel sharding compiles?"""
+    import torch
+
+    try:
+        compiled = torch.compile(lambda t: t * 2 + 1, fullgraph=True)
+        out = compiled(torch.ones(4, device=get_device_id()))
+        lam = f"lambda=OK({out.sum().item():.0f})"
+    except Exception as exc:  # noqa: BLE001
+        lam = f"lambda={type(exc).__name__}: {str(exc).splitlines()[0][:60]}"
+    ident = "cbm.module=?"
+    try:
+        from torch.nn.attention import flex_attention as _fa
+
+        ident = (
+            f"cbm.module={getattr(_fa.create_block_mask, '__module__', '?')}"
+            f" wrapped={hasattr(_fa.create_block_mask, '__wrapped__')}"
+            f" dynamo_disable={hasattr(_fa.create_block_mask, '_torchdynamo_disable')}"
+        )
+        cbm = torch.compile(_fa.create_block_mask, dynamic=False, fullgraph=True)
+        mask = cbm(lambda b, h, q, kv: q >= kv, 1, 1, 128, 128, device=get_device_id())
+        cb = f"create_block_mask=OK({type(mask).__name__})"
+    except Exception as exc:  # noqa: BLE001
+        cb = f"create_block_mask={type(exc).__name__}: {str(exc).splitlines()[0][:70]}"
+    return f"{lam} | {cb} | {ident}"
+
+
 def _dynamo_probe_once() -> None:
     """DIAGNOSTIC (VERL_TORCHTITAN_DYNAMO_PROBE): why the worker cannot torch.compile."""
     global _DYNAMO_PROBED
@@ -1366,6 +1394,9 @@ def _dynamo_probe_once() -> None:
         f"dynamo.config.disable={torch._dynamo.config.disable}",
         f"suppress_errors={torch._dynamo.config.suppress_errors}",
         f"is_dynamo_supported={getattr(torch._dynamo, 'is_dynamo_supported', lambda: 'n/a')()}",
+        f"is_compiling={torch.compiler.is_compiling()}",
+        f"eval_frame_callback={getattr(torch._dynamo.eval_frame, 'set_eval_frame', None) is not None}",
+        _probe_compile_here(),
         f"thread={threading.current_thread().name} main={threading.current_thread() is threading.main_thread()}",
         f"TORCHDYNAMO_DISABLE={os.environ.get('TORCHDYNAMO_DISABLE')} TORCH_COMPILE_DISABLE={os.environ.get('TORCH_COMPILE_DISABLE')}",
     ]
