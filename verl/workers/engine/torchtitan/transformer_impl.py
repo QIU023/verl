@@ -1370,7 +1370,7 @@ def _dynamo_probe_once() -> None:
     lines = [
         f"dynamo.config.disable={torch._dynamo.config.disable}",
         f"suppress_errors={torch._dynamo.config.suppress_errors}",
-        f"is_dynamo_supported={torch.compiler.is_dynamo_supported()}",
+        f"is_dynamo_supported={getattr(torch._dynamo, 'is_dynamo_supported', lambda: 'n/a')()}",
         f"thread={threading.current_thread().name} main={threading.current_thread() is threading.main_thread()}",
         f"TORCHDYNAMO_DISABLE={os.environ.get('TORCHDYNAMO_DISABLE')} TORCH_COMPILE_DISABLE={os.environ.get('TORCH_COMPILE_DISABLE')}",
     ]
