@@ -1373,17 +1373,18 @@ def _probe_compile_here() -> str:
     return f"{lam} | {cb} | {ident}"
 
 
-def _raise_recompile_limit_once() -> None:
+def _raise_recompile_limit() -> None:
     """DIAGNOSTIC (VERL_TORCHTITAN_RECOMPILE_LIMIT): give create_block_mask a bigger budget.
 
     torchtitan compiles ``create_block_mask`` twice without ``fullgraph``, and torch's
     context-parallel path compiles the same code object with it; past the default of 8
     dynamo stops compiling that frame and the fullgraph call reports no compiled frames.
+
+    Set on every call, not once per process: a dynamo config value lives in a
+    ``ContextVar``, and Ray runs each async actor method in its own task, so a write
+    made in one task is already gone by the next.
     """
     global _RECOMPILE_LIMIT_RAISED
-    if _RECOMPILE_LIMIT_RAISED:
-        return
-    _RECOMPILE_LIMIT_RAISED = True
     import sys
 
     import torch._dynamo
@@ -1393,12 +1394,14 @@ def _raise_recompile_limit_once() -> None:
     torch._dynamo.config.accumulated_recompile_limit = max(
         torch._dynamo.config.accumulated_recompile_limit, limit * 32
     )
-    print(
-        f"RECOMPILE-LIMIT raised to {torch._dynamo.config.recompile_limit} "
-        f"(accumulated {torch._dynamo.config.accumulated_recompile_limit})",
-        file=sys.stderr,
-        flush=True,
-    )
+    if not _RECOMPILE_LIMIT_RAISED:
+        _RECOMPILE_LIMIT_RAISED = True
+        print(
+            f"RECOMPILE-LIMIT raised to {torch._dynamo.config.recompile_limit} "
+            f"(accumulated {torch._dynamo.config.accumulated_recompile_limit})",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _dynamo_probe_once() -> None:
@@ -1934,7 +1937,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         if self.parallel_dims.cp_enabled and os.environ.get("VERL_TORCHTITAN_DYNAMO_PROBE"):
             _dynamo_probe_once()
         if self.parallel_dims.cp_enabled and os.environ.get("VERL_TORCHTITAN_RECOMPILE_LIMIT"):
-            _raise_recompile_limit_once()
+            _raise_recompile_limit()
         if self.parallel_dims.cp_enabled:
             # The model owns its context-parallel preprocessing on this tree: the masks
             # from the positions, the shards, the KDA routing and the layouts. Hand it
