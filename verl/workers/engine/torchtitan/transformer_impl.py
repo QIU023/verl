@@ -1342,6 +1342,7 @@ def _guard_fsdp_grad_upcast() -> None:
 
 
 _DYNAMO_PROBED = False
+_RECOMPILE_LIMIT_RAISED = False
 
 
 def _probe_compile_here() -> str:
@@ -1370,6 +1371,34 @@ def _probe_compile_here() -> str:
     except Exception as exc:  # noqa: BLE001
         cb = f"create_block_mask={type(exc).__name__}: {str(exc).splitlines()[0][:70]}"
     return f"{lam} | {cb} | {ident}"
+
+
+def _raise_recompile_limit_once() -> None:
+    """DIAGNOSTIC (VERL_TORCHTITAN_RECOMPILE_LIMIT): give create_block_mask a bigger budget.
+
+    torchtitan compiles ``create_block_mask`` twice without ``fullgraph``, and torch's
+    context-parallel path compiles the same code object with it; past the default of 8
+    dynamo stops compiling that frame and the fullgraph call reports no compiled frames.
+    """
+    global _RECOMPILE_LIMIT_RAISED
+    if _RECOMPILE_LIMIT_RAISED:
+        return
+    _RECOMPILE_LIMIT_RAISED = True
+    import sys
+
+    import torch._dynamo
+
+    limit = int(os.environ["VERL_TORCHTITAN_RECOMPILE_LIMIT"])
+    torch._dynamo.config.recompile_limit = limit
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        torch._dynamo.config.accumulated_recompile_limit, limit * 32
+    )
+    print(
+        f"RECOMPILE-LIMIT raised to {torch._dynamo.config.recompile_limit} "
+        f"(accumulated {torch._dynamo.config.accumulated_recompile_limit})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _dynamo_probe_once() -> None:
@@ -1904,6 +1933,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     extra_kwargs["attention_masks"] = attention_mask
         if self.parallel_dims.cp_enabled and os.environ.get("VERL_TORCHTITAN_DYNAMO_PROBE"):
             _dynamo_probe_once()
+        if self.parallel_dims.cp_enabled and os.environ.get("VERL_TORCHTITAN_RECOMPILE_LIMIT"):
+            _raise_recompile_limit_once()
         if self.parallel_dims.cp_enabled:
             # The model owns its context-parallel preprocessing on this tree: the masks
             # from the positions, the shards, the KDA routing and the layouts. Hand it
