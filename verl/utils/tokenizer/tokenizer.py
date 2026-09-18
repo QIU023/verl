@@ -143,7 +143,7 @@ def processor_takes_medias(processor) -> bool:
 
     try:
         return "medias" in inspect.signature(processor.__call__).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return False
 
 
