@@ -891,14 +891,7 @@ class TorchTitanEngine(BaseEngine):
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
 
-        # Extract step number from path (verl uses global_step_N format)
-        match = re.search(r"global_step_(\d+)", local_path)
-        if match:
-            step = int(match.group(1))
-            self.checkpointer.load(step=step)
-        else:
-            # Fallback to latest
-            self.checkpointer.load(step=-1)
+        self.checkpointer.load(step=checkpoint_step_from_path(local_path))
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -1422,6 +1415,16 @@ def initial_checkpoint_source(initial_load_path: str | None, model_path: str) ->
     since a model whose frozen bases are packed (QLoRA) has no HF spelling for them.
     """
     return initial_load_path is None, initial_load_path or model_path
+
+
+def checkpoint_step_from_path(local_path: str) -> int:
+    """The step verl's ``global_step_N`` path names, or -1 for the latest.
+
+    verl hands the engine a path whose last component carries the step; the
+    checkpointer wants the number. A path without one means load the latest.
+    """
+    match = re.search(r"global_step_(\d+)", local_path)
+    return int(match.group(1)) if match else -1
 
 
 def pipeline_token_budget(configured: int | None, tokens: int) -> int:
