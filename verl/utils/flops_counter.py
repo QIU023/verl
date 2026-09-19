@@ -675,7 +675,96 @@ def _estimate_hy_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
     return flops_achieved
 
 
+def _estimate_kimi_k3_flops(config, tokens_sum, batch_seqlens, delta_time):
+    """Kimi K3: MLA on the full-attention layers, KDA on the rest, a latent MoE.
+
+    The layer schedule is explicit in the config (``full_attn_layers`` and
+    ``kda_layers``), so the two attention costs are counted per layer rather
+    than averaged. KDA is linear attention: its cost is per token, not per
+    token pair, so it contributes to the dense term and not to the quadratic one.
+    """
+    cfg = getattr(config, "text_config", None) or config
+
+    hidden_size = cfg.hidden_size
+    vocab_size = cfg.vocab_size
+    num_hidden_layers = cfg.num_hidden_layers
+    first_k_dense_replace = getattr(cfg, "first_k_dense_replace", 0)
+    num_query_heads = cfg.num_attention_heads
+    moe_intermediate_size = cfg.moe_intermediate_size
+    moe_num_expert = cfg.num_experts
+    moe_topk = cfg.num_experts_per_token
+    share_expert_num = getattr(cfg, "num_shared_experts", 0) or 0
+
+    full_attn_layers = set(getattr(cfg, "full_attn_layers", None) or [])
+    kda_layers = set(getattr(cfg, "kda_layers", None) or [])
+    if not full_attn_layers and not kda_layers:
+        full_attn_layers = set(range(1, num_hidden_layers + 1))
+
+    # MLA, as deepseek_v3 counts it
+    q_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+    mla_N = 0
+    q_lora_rank = getattr(cfg, "q_lora_rank", None)
+    if q_lora_rank is None:
+        mla_N += hidden_size * num_query_heads * q_head_dim
+    else:
+        mla_N += hidden_size * q_lora_rank
+        mla_N += num_query_heads * q_head_dim * q_lora_rank
+    mla_N += hidden_size * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)
+    mla_N += num_query_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim) * cfg.kv_lora_rank
+    mla_N += num_query_heads * cfg.v_head_dim * hidden_size
+
+    # KDA: q/k/v and the output projection, the two-stage forget gate, beta,
+    # the output gate, the depthwise short convolutions, and the delta-rule
+    # state, which is read and written once per token at head_dim squared.
+    kda_heads = getattr(cfg, "kda_num_heads", 0) or 0
+    kda_head_dim = getattr(cfg, "kda_head_dim", 0) or 0
+    kda_P = kda_heads * kda_head_dim
+    conv_k = getattr(cfg, "kda_short_conv_kernel_size", 0) or 0
+    kda_N = 0
+    if kda_P:
+        kda_N += 3 * hidden_size * kda_P          # q, k, v
+        kda_N += kda_P * hidden_size              # output_proj
+        kda_N += hidden_size * kda_head_dim       # forget_a
+        kda_N += kda_head_dim * kda_P             # forget_b
+        kda_N += hidden_size * kda_heads          # beta
+        kda_N += hidden_size * kda_P              # output_gate
+        kda_N += 3 * conv_k * kda_P               # depthwise short convs
+        kda_N += 2 * kda_heads * kda_head_dim * kda_head_dim  # state write and read
+
+    # MoE. With a latent MoE the routed experts run at routed_expert_hidden_size
+    # behind a down and an up projection; the shared experts stay at model width.
+    latent_dim = getattr(cfg, "routed_expert_hidden_size", None)
+    moe_gate_N = hidden_size * moe_num_expert
+    if latent_dim:
+        moe_N_layer = moe_gate_N
+        moe_N_layer += hidden_size * latent_dim * 2                      # routed_down, routed_up
+        moe_N_layer += latent_dim * moe_intermediate_size * 3 * moe_topk  # routed experts, SwiGLU
+        moe_N_layer += hidden_size * moe_intermediate_size * 3 * share_expert_num
+    else:
+        moe_N_layer = moe_gate_N
+        moe_N_layer += hidden_size * moe_intermediate_size * 3 * (moe_topk + share_expert_num)
+    dense_ffn_N = hidden_size * cfg.intermediate_size * 3
+
+    total_N = vocab_size * hidden_size * 2
+    seqlen_square_sum = 0
+    for layer in range(1, num_hidden_layers + 1):
+        attn_N = kda_N if layer in kda_layers else mla_N
+        ffn_N = dense_ffn_N if layer <= first_k_dense_replace else moe_N_layer
+        total_N += attn_N + ffn_N
+        if layer not in kda_layers:
+            for seqlen in batch_seqlens:
+                seqlen_square_sum += seqlen * seqlen
+
+    dense_N_flops = 6 * total_N * tokens_sum
+    # causal MLA core attention, forward and backward
+    attn_qkv_flops = 12 * seqlen_square_sum * (q_head_dim + cfg.v_head_dim) * num_query_heads / 2
+    flops_all_token = dense_N_flops + attn_qkv_flops
+    return flops_all_token / delta_time / 1e12
+
+
 ESTIMATE_FUNC = {
+    "kimi_k3": _estimate_kimi_k3_flops,
+    "kimi_linear": _estimate_kimi_k3_flops,
     "qwen2": _estimate_qwen2_flops,
     "llama": _estimate_qwen2_flops,
     "qwen2_moe": _estimate_qwen2_moe_flops,
