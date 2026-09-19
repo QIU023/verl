@@ -502,6 +502,12 @@ class TorchtitanEngineConfig(EngineConfig):
         expert_tensor_parallel_size (int): Expert tensor parallel size, default 1
         pipeline_parallel_size (int): Pipeline parallel size, default 1
         context_parallel_size (int): Context parallel size, default 1
+        sequence_parallel (bool): sequence parallel on the tensor-parallel axis, default True
+        pipeline_token_budget (int | None): under pipeline parallelism every micro-batch is padded to this
+            many tokens so the stages size their buffers once; at least the largest packed micro-batch
+        initial_load_path (str | None): a torchtitan DCP checkpoint to start the trainer from instead
+            of the HF weights at model.path (a packed-MXFP4 QLoRA model has no HF spelling for its
+            bases); model.path still serves the rollout engine
         attn_type (str): Attention type for torchtitan's model (e.g., "sdpa", "flex", "varlen"),
             default "flex"
         spmd_backend (str): torchtitan SPMD backend, one of "default", "full_dtensor", "spmd_types",
@@ -537,6 +543,9 @@ class TorchtitanEngineConfig(EngineConfig):
     expert_tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     context_parallel_size: int = 1
+    sequence_parallel: bool = True
+    initial_load_path: Optional[str] = None
+    pipeline_token_budget: Optional[int] = None
     attn_type: str = "flex"
     spmd_backend: str = "spmd_types"
     activation_checkpoint: str = "selective"

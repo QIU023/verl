@@ -17,6 +17,8 @@ The concrete Engine implementation using PyTorch TorchTitan parallelism (FSDP2 +
 
 import importlib
 import logging
+import inspect
+import math
 import os
 import re
 from contextlib import nullcontext
@@ -26,14 +28,42 @@ import torch
 import torch.distributed
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
-from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+
+
+def _parallelism_compat_kwargs(spmd_backend: str, cp_enabled: bool) -> dict:
+    """ParallelismConfig fields whose shape differs across the torchtitan trees this engine runs on.
+
+    Older trees take ``spmd_backend``; current ones dropped it (spmd_types is the only backend).
+    Under context parallel the shards are contiguous and rank-ordered: the engine gathers the
+    logits back in rank order (_finish_pred), which a permuting balancer (head-tail) would scramble.
+    """
+    fields = ParallelismConfig.__dataclass_fields__
+    kwargs = {}
+    if "spmd_backend" in fields:
+        kwargs["spmd_backend"] = spmd_backend
+    if cp_enabled:
+        # torchtitan models this field two ways: a ContextParallelLoadBalancerConfig on
+        # trees that define it, and a plain str | None elsewhere. Pin the balancer off in
+        # whichever shape the tree exposes.
+        try:
+            from torchtitan.config import ContextParallelLoadBalancerConfig
+        except ImportError:
+            kwargs["context_parallel_load_balancer"] = None
+        else:
+            kwargs["context_parallel_load_balancer"] = ContextParallelLoadBalancerConfig(
+                load_balancer_type=None
+            )
+    return kwargs
+
+from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
 
@@ -130,8 +160,38 @@ class TorchTitanEngine(BaseEngine):
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
 
         # Get ModelSpec from model registry
-        model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
-        model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
+        from .utils import _import_torchtitan_model_module
+
+        model_module = _import_torchtitan_model_module(torchtitan_name)
+        # Two naming spaces in a model package: model_registry parses
+        # "<size>_<variant>", while some flavors are config_registry FUNCTIONS
+        # whose names its parser cannot reach.
+        try:
+            model_spec = model_module.model_registry(
+                torchtitan_flavor, attn_backend=self.engine_config.attn_type
+            )
+        except (ValueError, KeyError):
+            # model_registry raises KeyError for a name its parser does not
+            # know and ValueError for one it parses but does not have; the
+            # config_registry functions are reached through either.
+            import importlib
+
+            try:
+                config_registry = importlib.import_module(
+                    f"{model_module.__name__}.config_registry"
+                )
+            except ImportError:
+                config_registry = None
+            fn = getattr(config_registry, torchtitan_flavor, None) if config_registry else None
+            if fn is None or not callable(fn):
+                raise
+            model_spec = fn().model_spec
+        # The checkpoint decides whether the output head is tied to the embedding; a
+        # flavor derived by shape may say otherwise (Qwen3-0.6B ties, an untied copy of it
+        # carries lm_head.weight), and torchtitan refuses tying under pipeline parallel.
+        tied = getattr(self.model_config.hf_config, "tie_word_embeddings", None)
+        if tied is False and getattr(model_spec.model, "enable_weight_tying", False):
+            model_spec.model.enable_weight_tying = False
 
         optimizer = OptimizersContainer.Config(
             param_groups=[
@@ -163,16 +223,27 @@ class TorchTitanEngine(BaseEngine):
             data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
             fsdp_reshard_after_forward=self.engine_config.reshard_after_forward,
             tensor_parallel_degree=self.engine_config.tensor_parallel_size,
+            enable_sequence_parallel=self.engine_config.sequence_parallel,
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend=self.engine_config.spmd_backend,
+            **_parallelism_compat_kwargs(
+                self.engine_config.spmd_backend, self.engine_config.context_parallel_size > 1
+            ),
+        )
+        load_in_hf, load_path = initial_checkpoint_source(
+            self.engine_config.initial_load_path, model_config.path
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
-            initial_load_in_hf=True,
+            initial_load_in_hf=load_in_hf,
             initial_load_model_only=True,
-            initial_load_path=model_config.path,
+            initial_load_path=load_path,
+            # verl's trainer.save_freq is the cadence authority and save() is
+            # only called on those steps; defer torchtitan's own interval to 1
+            # so every requested save writes (default 500 silently drops all
+            # saves in runs shorter than 500 / not multiples of it).
+            interval=1,
         )
         compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
         training_kwargs = {}
@@ -212,6 +283,17 @@ class TorchTitanEngine(BaseEngine):
             loss=CrossEntropyLoss.Config(),
         )
         self.trainer = Trainer(self.config)
+        # Decoders on torchtitan main take a folded [T] token stream and own their input
+        # preprocessing (masks, CP shards, layouts); probed on the model, not on its name.
+        from torchtitan.protocols.model import BaseModel
+
+        self._folded_token_stream = (
+            type(self.trainer.model_parts[0]).preprocess_inputs is not BaseModel.preprocess_inputs
+        )
+        self._forward_params = frozenset(
+            inspect.signature(type(self.trainer.model_parts[0]).forward).parameters
+        )
+        self._forward_takes_cu_seqlens = "cu_seqlens" in self._forward_params
 
         self._init_device_mesh()
 
@@ -298,17 +380,10 @@ class TorchTitanEngine(BaseEngine):
 
     def _init_device_mesh(self):
         """Initialize the device mesh for TorchTitan style parallelism."""
-        world_size = torch.distributed.get_world_size()
-        self.parallel_dims = ParallelDims(
-            dp_shard=self.engine_config.data_parallel_shard_size,
-            dp_replicate=self.engine_config.data_parallel_replicate_size,
-            cp=self.engine_config.context_parallel_size,
-            tp=self.engine_config.tensor_parallel_size,
-            pp=self.engine_config.pipeline_parallel_size,
-            ep=self.engine_config.expert_parallel_size,
-            world_size=world_size,
-        )
-        self.device_mesh = self.parallel_dims.build_mesh()
+        # The trainer's ParallelDims and mesh: the model's SPMD context and the engine's
+        # gathers must name the same process groups.
+        self.parallel_dims = self.trainer.parallel_dims
+        self.device_mesh = self.parallel_dims._world_mesh
 
         # Mirror torchtitan's init_distributed (which verl bypasses): disable autograd
         # multithreading so backward-thread activation-checkpoint recompute can access the
@@ -349,13 +424,25 @@ class TorchTitanEngine(BaseEngine):
         raise NotImplementedError
 
     def _get_data_parallel_mesh(self):
-        """Get the data parallel mesh, handling hybrid/fully/replicate shard modes."""
-        mesh = self.parallel_dims.get_optional_mesh("loss")
-        if mesh is None:
-            mesh = self.parallel_dims.get_optional_mesh("fsdp")
-        if mesh is None:
-            mesh = self.parallel_dims.get_optional_mesh("dp_replicate")
-        return mesh
+        """The mesh verl treats as data parallel.
+
+        torchtitan's "fsdp" mesh is dp_shard x cp -- FSDP folds cp into its
+        shard axis -- and it only exists when that product is > 1. What verl
+        needs is the sampler axis, dp_replicate x dp_shard; "fsdp" is used
+        because under cp > 1 with no real dp the correct answer is still
+        "one replica" and the fsdp mesh carries that. When neither axis is
+        enabled (pp or tp alone) there is no data-parallel mesh at all.
+        """
+        parallel_dims = self.parallel_dims
+        candidates = (["dp_replicate", "fsdp"], "fsdp", ["dp_replicate", "dp_shard"], "dp_shard", "dp")
+        for names in candidates:
+            try:
+                mesh = parallel_dims.get_optional_mesh(names)
+            except ValueError:
+                continue
+            if mesh is not None:
+                return mesh
+        return None
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
@@ -413,10 +500,42 @@ class TorchTitanEngine(BaseEngine):
         else:
             # Non-PP forward. train_context (SPMD mesh) is set by the caller.
             assert len(model_parts) == 1
-            pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
+            folded = getattr(model_parts[0], "folded_token_stream", False) or self._folded_token_stream
+            if folded and inputs.dim() == 2 and inputs.shape[0] == 1:
+                # Folded-stream decoders take [T] token streams; the
+                # rmpad path packs to [1, T]. Fold in, unfold the logits out.
+                squeezed_inputs = inputs.squeeze(0)
+                squeezed_extra = _squeeze_folded(extra_inputs or {})
+                pred = model_parts[0](squeezed_inputs, **squeezed_extra, **extra_kwargs)
+                if pred.dim() == 2:
+                    pred = pred.unsqueeze(0)
+            else:
+                pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
+        return self._finish_pred(pred)
+
+    def _finish_pred(self, pred: torch.Tensor) -> torch.Tensor:
+        """Bring a stage's logits to the layout the loss side expects."""
+        parallel_dims = self.parallel_dims
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
+        # Under tensor parallel the head's logits come back as this rank's shard:
+        # of the vocabulary (the loss-parallel layout under spmd_types) or of
+        # the sequence (a replicated head on a sequence-parallel stream). The loss
+        # side works on full [T, V] logits, so gather the sharded dim over the tp
+        # group -- before the CP gather below, tp being the inner split.
+        if parallel_dims.tp_enabled and pred.dim() == 3:
+            hf_config = self.model_config.hf_config
+            vocab = getattr(getattr(hf_config, "text_config", None), "vocab_size", None) or getattr(hf_config, "vocab_size", None)
+            tp_group = parallel_dims.get_mesh("tp").get_group()
+            # Every tp rank computes the same full loss, so the gather's backward takes this rank's
+            # slice unscaled; the Ulysses scaling would multiply every gradient by the tp degree.
+            if vocab is not None and pred.shape[-1] * parallel_dims.tp == vocab:
+                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=2, grad_scaler=False, group=tp_group)
+            elif vocab is not None and pred.shape[-1] != vocab:
+                raise ValueError(f"logits vocab dim {pred.shape[-1]} is neither the vocabulary ({vocab}) nor its tp shard")
+            elif getattr(self.module[-1], "_sp_group", None) is not None:
+                pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, grad_scaler=False, group=tp_group)
         return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -513,14 +632,7 @@ class TorchTitanEngine(BaseEngine):
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
 
-        # Extract step number from path (verl uses global_step_N format)
-        match = re.search(r"global_step_(\d+)", local_path)
-        if match:
-            step = int(match.group(1))
-            self.checkpointer.load(step=step)
-        else:
-            # Fallback to latest
-            self.checkpointer.load(step=-1)
+        self.checkpointer.load(step=checkpoint_step_from_path(local_path))
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -674,6 +786,62 @@ class TorchTitanEngine(BaseEngine):
         return _gen(), None
 
 
+# Multimodal tensors keep their own leading dimension (images, not the folded stream).
+_MULTIMODAL_KEYS = ("pixel_values", "grid_thw", "pixel_values_videos", "grid_thw_videos", "special_tokens")
+
+
+def initial_checkpoint_source(initial_load_path: str | None, model_path: str) -> tuple[bool, str]:
+    """Where the first load comes from: ``(load_in_hf, path)``.
+
+    A torchtitan DCP checkpoint takes precedence over the HF weights at ``model.path``,
+    since a model whose frozen bases are packed (QLoRA) has no HF spelling for them.
+    """
+    return initial_load_path is None, initial_load_path or model_path
+
+
+def checkpoint_step_from_path(local_path: str) -> int:
+    """The step verl's ``global_step_N`` path names, or -1 for the latest.
+
+    verl hands the engine a path whose last component carries the step; the
+    checkpointer wants the number. A path without one means load the latest.
+    """
+    match = re.search(r"global_step_(\d+)", local_path)
+    return int(match.group(1)) if match else -1
+
+
+def _squeeze_folded(extra: dict) -> dict:
+    """Fold ``[1, T]`` stream tensors to ``[T]``; multimodal tensors keep their batch axis."""
+    return {
+        k: (
+            v.squeeze(0)
+            if k not in _MULTIMODAL_KEYS and torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == 1
+            else v
+        )
+        for k, v in extra.items()
+    }
+
+
+def _cu_seqlens_from_positions(positions):
+    """Packed offsets ``[0, ..., T]`` of a folded ``[T]`` (or ``[1, T]``) stream from its
+    positions: a document starts where the position restarts at 0. ``None`` without an
+    interior restart, so a single sequence keeps the single-sequence kernels."""
+    if positions is None:
+        return None
+    if positions.dim() == 2 and positions.shape[0] == 1:
+        positions = positions[0]
+    if positions.dim() != 1:
+        return None
+    num_tokens = positions.shape[0]
+    starts = torch.nonzero(positions == 0).flatten()
+    if starts.numel() == 0 or int(starts[0]) != 0:
+        starts = torch.cat((starts.new_zeros(1), starts))
+    if starts.numel() == 1:
+        return None
+    return torch.cat((starts, starts.new_full((1,), num_tokens))).to(torch.int32)
+
+
+
+
 class EngineEvalModeCtx(BaseEngineCtx):
     def __init__(self, engine: TorchTitanEngine, **kwargs):
         super().__init__(engine=engine, mode="eval", **kwargs)
@@ -773,6 +941,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # dict as extra_inputs are not forwarded to other stages in PP, but
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
+        cp_pad_len = 0
+        pad_multiple = 1
         if self.parallel_dims.cp_enabled:
             input_ids, labels, extra_kwargs = prepare_context_parallel_input(
                 input_ids,
@@ -782,10 +952,63 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 self.trainer.device,
                 self.trainer.config.parallelism.context_parallel_load_balancer,
             )
+        if self.parallel_dims.tp_enabled:
+            # Sequence parallel scatters the token dim across the TP ranks, so the
+            # packed stream must divide by the TP degree as well.
+            pad_multiple = math.lcm(pad_multiple, self.parallel_dims.tp)
+        if pad_multiple > 1:
+            pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+            input_ids, position_ids, cp_pad_len = ulysses_pad(
+                input_ids, position_ids, sp_size=pad_multiple, pad_value=pad_id
+            )
+            if cp_pad_len:
+                # The positions: ulysses_pad numbers the padding from zero,
+                # which reads as the start of a new document to a mask built
+                # from positions -- this model's does. Renumber the padding to
+                # continue the stream instead.
+                continued = torch.arange(
+                    1, cp_pad_len + 1, device=position_ids.device
+                )
+                if position_ids.dim() == 3:
+                    position_ids[..., -cp_pad_len:] = (
+                        position_ids[..., -cp_pad_len - 1 : -cp_pad_len] + continued
+                    )
+                else:
+                    position_ids[:, -cp_pad_len:] = (
+                        position_ids[:, -cp_pad_len - 1 : -cp_pad_len] + continued
+                    )
+                # Labels ride along so they stay aligned with the logits; both
+                # are unpadded before the loss (prepare_model_outputs).
+                labels = torch.nn.functional.pad(labels, (0, cp_pad_len), value=pad_id)
+                extra_inputs["positions"] = position_ids
+                if attention_mask is not None:
+                    attention_mask = get_attention_masks(
+                        input_batch=input_ids,
+                        positions=position_ids,
+                        attn_type=self.engine_config.attn_type,
+                    )
+                    extra_kwargs["attention_masks"] = attention_mask
+        if self._folded_token_stream:
+            # A model whose forward takes the packed stream's document offsets (a
+            # linear-attention recurrence, which would otherwise run across the
+            # documents of a micro-batch) gets them explicitly; a document starts where
+            # the positions restart at 0.
+            if self._forward_takes_cu_seqlens:
+                cu_seqlens = _cu_seqlens_from_positions(extra_inputs.get("positions"))
+                if cu_seqlens is not None:
+                    extra_kwargs["cu_seqlens"] = cu_seqlens
+            if extra_kwargs.get("attention_masks") is not None and hasattr(self.module[0], "get_attention_masks"):
+                # The model builds its own masks from the [T] positions: current trees key
+                # them by consumer (a flex BlockMask, varlen offsets, and so on).
+                positions = extra_inputs["positions"]
+                if positions.dim() == 2 and positions.shape[0] == 1:
+                    positions = positions.squeeze(0)
+                extra_kwargs["attention_masks"] = self.module[0].get_attention_masks(positions=positions)
 
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
         output_args["labels"] = labels
+        output_args["cp_pad_len"] = cp_pad_len
         return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
@@ -796,6 +1019,12 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         temperature = micro_batch["temperature"]
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
         labels = output_args["labels"]
+        # Drop the rows the CP padding added, so everything below sees the
+        # packed stream at its true length (see prepare_model_inputs).
+        cp_pad_len = output_args.get("cp_pad_len", 0)
+        if cp_pad_len:
+            logits = logits[:, :-cp_pad_len]
+            labels = labels[:, :-cp_pad_len]
         model_output = {}
 
         input_ids = micro_batch["input_ids"]

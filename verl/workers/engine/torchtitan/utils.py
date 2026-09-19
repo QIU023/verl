@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.nn.attention.flex_attention import _mask_mod_signature, and_masks
-from torchtitan.components.dataloader import BaseDataLoader
+from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     VarlenMetadata,
@@ -77,6 +77,14 @@ _HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
 }
 
 
+def _import_torchtitan_model_module(name: str):
+    """Import a torchtitan model package from models/ or experiments/."""
+    try:
+        return importlib.import_module(f"torchtitan.models.{name}")
+    except ModuleNotFoundError:
+        return importlib.import_module(f"torchtitan.experiments.{name}")
+
+
 def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
     """Derive torchtitan model name and flavor from a HuggingFace config.
 
@@ -93,11 +101,21 @@ def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
     Raises:
         ValueError: If model_type is unsupported or no matching flavor is found.
     """
+    import os
+
     model_type = getattr(hf_config, "model_type", None)
     if model_type is None:
         raise ValueError("HuggingFace config does not have 'model_type' field")
 
     name = _HF_MODEL_TYPE_TO_TORCHTITAN_NAME.get(model_type)
+
+    # Explicit override for variant flavors that share backbone dims with
+    # the auto-derived one (e.g. an AttnRes graft or LoRA flavor).
+    forced = os.environ.get("VERL_TORCHTITAN_FLAVOR")
+    if forced:
+        if name is None:
+            raise ValueError(f"Unsupported model_type '{model_type}'.")
+        return name, forced
     if name is None:
         raise ValueError(
             f"Cannot derive torchtitan model name from HF model_type '{model_type}'. "
@@ -106,7 +124,7 @@ def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
 
     # Import the model package and use model_registry to build each flavor's config.
     # model_registry has sensible defaults for all optional params (attn_backend, etc.).
-    model_module = importlib.import_module(f"torchtitan.models.{name}")
+    model_module = _import_torchtitan_model_module(name)
     model_registry = model_module.model_registry
 
     # The configs dict name isn't derivable from the model name

@@ -58,6 +58,15 @@ pipeline_parallel_size: 1
 # Context parallel size
 context_parallel_size: 1
 
+# Sequence parallel on the tensor-parallel axis
+sequence_parallel: true
+
+# A torchtitan DCP checkpoint to start the trainer from instead of the HF weights at model.path
+initial_load_path: null
+
+# Under pipeline parallelism, the token count every micro-batch is padded to (null: VERL_PP_TOKEN_BUDGET)
+pipeline_token_budget: null
+
 # Attention type for torchtitan's model (e.g., "sdpa", "flex", "varlen")
 attn_type: flex
 
