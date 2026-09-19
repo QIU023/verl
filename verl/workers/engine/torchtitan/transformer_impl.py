@@ -94,6 +94,7 @@ def _context_parallel_transform(model_config, backend: str) -> ContextParallelTr
     Flex attention takes the Ulysses backend by default: it keeps the attention masks
     global, whereas the all-gather-KV backend shards the flex BlockMask through torch's
     compiled ``create_block_mask``, which the colocated worker process cannot compile.
+    A KDA inner attention, where the tree has one, takes its CP routing counterpart.
     Subtrees whose tokens are not sharded on the cp axis (a vision tower) keep their
     local attention.
     """
@@ -109,6 +110,14 @@ def _context_parallel_transform(model_config, backend: str) -> ContextParallelTr
     if not any(True for _ in model_config.traverse(FlexInnerAttention.Config)):
         raise ValueError("context parallel needs attn_type 'flex': the CP backends are flex based")
     mapping: dict = {FlexInnerAttention.Config: flex_backends[backend]}
+    try:
+        from torchtitan.models.kimi_k3.cp_kda import ContextParallelInnerKDA
+        from torchtitan.models.kimi_k3.kda import InnerKDA
+    except ImportError:
+        pass
+    else:
+        if any(True for _ in model_config.traverse(InnerKDA.Config)):
+            mapping[InnerKDA.Config] = ContextParallelInnerKDA
     return ContextParallelTransform(inner_attention=mapping, exclude_fqn_prefixes=("vision_encoder",))
 
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
@@ -264,9 +273,11 @@ class TorchTitanEngine(BaseEngine):
         from .utils import _import_torchtitan_model_module
 
         model_module = _import_torchtitan_model_module(torchtitan_name)
-        # Two naming spaces in a model package: model_registry parses
-        # "<size>_<variant>", while some flavors are config_registry FUNCTIONS
-        # whose names its parser cannot reach.
+        # Two naming spaces in the kimi_k3 package: model_registry parses
+        # "<size>_<variant>", while the debug, report-architecture and QAT
+        # flavors are config_registry FUNCTIONS whose names it cannot parse.
+        # Without the fallback, VERL_TORCHTITAN_FLAVOR can only reach the first
+        # kind, which silently excludes every flavor defined the second way.
         try:
             model_spec = model_module.model_registry(
                 torchtitan_flavor, attn_backend=self.engine_config.attn_type
@@ -720,7 +731,7 @@ class TorchTitanEngine(BaseEngine):
         if isinstance(pred, DTensor):
             pred = pred.full_tensor()
         # Under tensor parallel the head's logits come back as this rank's shard:
-        # of the vocabulary (the loss-parallel layout under spmd_types) or of
+        # of the vocabulary (loss-parallel layout, Kimi K3 under spmd_types) or of
         # the sequence (a replicated head on a sequence-parallel stream). The loss
         # side works on full [T, V] logits, so gather the sharded dim over the tp
         # group -- before the CP gather below, tp being the inner split.
@@ -1196,6 +1207,8 @@ def _guard_fsdp_grad_upcast() -> None:
     FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
+# Processor output names that differ from the model's forward parameters.
+_MULTIMODAL_KEY_ALIASES = {"grid_thws": "grid_thw", "image_grid_thw": "grid_thw"}
 # Multimodal tensors keep their own leading dimension (images, not the folded stream).
 _MULTIMODAL_KEYS = ("pixel_values", "grid_thw", "pixel_values_videos", "grid_thw_videos", "special_tokens")
 
@@ -1241,6 +1254,27 @@ def pipeline_token_budget(configured: int | None, tokens: int) -> int:
     return budget
 
 
+def _model_multimodal_kwargs(multi_modal_inputs: dict, forward_params, placeholder_id) -> dict:
+    """The processor's multimodal outputs as the model's forward keyword arguments.
+
+    Renames the processor's spellings, keeps only what the forward takes, and adds the
+    placeholder token the model looks for (``special_tokens={"image_id": ...}``) when
+    images are present.
+    """
+    out = {}
+    for key, value in multi_modal_inputs.items():
+        name = _MULTIMODAL_KEY_ALIASES.get(key, key)
+        if name in forward_params:
+            out[name] = value
+    pixel_values = out.get("pixel_values")
+    if torch.is_tensor(pixel_values) and pixel_values.dim() == 4:
+        # the processor's [patches, C, p, p]; the model takes [patches, C * p * p]
+        out["pixel_values"] = pixel_values.flatten(1)
+    if "pixel_values" in out and "special_tokens" in forward_params and placeholder_id is not None:
+        out["special_tokens"] = {"image_id": int(placeholder_id)}
+    return out
+
+
 def _squeeze_folded(extra: dict) -> dict:
     """Fold ``[1, T]`` stream tensors to ``[T]``; multimodal tensors keep their batch axis."""
     return {
@@ -1273,11 +1307,11 @@ def _cu_seqlens_from_positions(positions):
 
 
 def _titan_lora_wrappers(module):
-    """``{fqn: wrapper}`` for every LoRA-wrapped linear in the module.
+    """``{fqn: wrapper}`` for every KimiLoRALinear in the module.
 
     Discovered from the module rather than from the config, because ``apply_lora``
     decides what actually got wrapped (its target list matches leaf names AND
-    qualified suffixes, and it skips subtrees it cannot wrap). A config-derived
+    qualified suffixes, and it skips the KDA subtree structurally). A config-derived
     list would claim targets that were never wrapped.
     """
     found = {}
@@ -1410,7 +1444,7 @@ def _adapter_state_dict(wrappers, hf_names):
 
     Safe to ship the raw factors because the base mapping this borrows names from is a
     pure RENAME for every LoRA target. The only value transform on the single-tensor
-    path is the 4-D ``A_log`` reshape, which ``apply_lora`` never reaches
+    path is the 4-D ``A_log`` reshape, and ``apply_lora`` skips the KDA subtree
     structurally, so no wrapped module is ever reshaped. Routed experts are likewise
     out of reach -- they are 3-D GroupedExperts parameters, not ``nn.Linear``.
     """
@@ -1428,7 +1462,7 @@ def _warn_wrapped_bases_missing(params, hf_names) -> None:
     if missing:
         # Reported, not silent -- and a warning rather than a raise, which is a real
         # distinction here. Two absences are legitimate: under PP a rank does not own
-        # every layer, and a graft-only target can have no HF
+        # every layer, and a graft-only target (the K3 attention gate) can have no HF
         # destination at all because to_hf drops what the original architecture has no
         # key for. Raising would break both.
         #
@@ -1550,6 +1584,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
+        model_mm_kwargs = _model_multimodal_kwargs(
+            multi_modal_inputs,
+            self._forward_params,
+            getattr(self.model_config.hf_config, "media_placeholder_token_id", None),
+        )
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
         output_args = {}
@@ -1670,7 +1709,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     extra_kwargs["attention_masks"] = attention_mask
         if self.parallel_dims.cp_enabled:
             # The model owns its context-parallel preprocessing on this tree: the masks
-            # from the positions, the shards and the layouts. Hand it
+            # from the positions, the shards, the KDA routing and the layouts. Hand it
             # the folded [T] stream with the global positions and take back this
             # rank's inputs and kwargs. Labels stay FULL length: verl's loss path
             # (nested no-padding log_prob / loss_mask handling) assumes full
@@ -1683,6 +1722,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 "labels": labels.squeeze(0),
                 "positions": position_ids.squeeze(0),
             }
+            # Images ride through the model's preprocessing, which builds their bank
+            # indices and shards them with the stream; they are not added again below.
+            batch.update(model_mm_kwargs)
+            model_mm_kwargs = {}
             local_inputs, _labels_local, extra_kwargs = self.module[0].preprocess_inputs(
                 batch,
                 parallel_dims=self.parallel_dims,
@@ -1691,8 +1734,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             input_ids = local_inputs.unsqueeze(0)
             extra_inputs = {}
         elif self._folded_token_stream:
-            # A model whose forward takes the packed stream's document offsets (a
-            # linear-attention recurrence, which would otherwise run across the
+            # A model whose forward takes the packed stream's document offsets (KDA's
+            # recurrence and short convolution, which would otherwise run across the
             # documents of a micro-batch) gets them explicitly; a document starts where
             # the positions restart at 0.
             if self._forward_takes_cu_seqlens:
@@ -1701,14 +1744,13 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     extra_kwargs["cu_seqlens"] = cu_seqlens
             if extra_kwargs.get("attention_masks") is not None and hasattr(self.module[0], "get_attention_masks"):
                 # The model builds its own masks from the [T] positions: current trees key
-                # them by consumer (a flex BlockMask, varlen offsets, and so on).
+                # them by consumer (a flex BlockMask for MLA, varlen offsets for KDA).
                 positions = extra_inputs["positions"]
                 if positions.dim() == 2 and positions.shape[0] == 1:
                     positions = positions.squeeze(0)
                 extra_kwargs["attention_masks"] = self.module[0].get_attention_masks(positions=positions)
 
-        # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
-        extra_inputs.update(multi_modal_inputs)
+        extra_inputs.update(model_mm_kwargs)
         output_args["labels"] = labels
         output_args["cp_pad_len"] = cp_pad_len
         return input_ids, extra_inputs, extra_kwargs, output_args

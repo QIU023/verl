@@ -69,6 +69,31 @@ def collate_fn(data_list: list[dict]) -> dict:
     return {**tensors, **non_tensors}
 
 
+def _images_from_messages(messages: list[dict]) -> list:
+    """The image content blocks of the messages, as PIL images."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    images = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "image":
+                continue
+            image = block.get("image")
+            if isinstance(image, dict) and "bytes" in image:
+                image = Image.open(BytesIO(image["bytes"]))
+            elif isinstance(image, (bytes, bytearray)):
+                image = Image.open(BytesIO(image))
+            elif isinstance(image, str):
+                image = Image.open(image)
+            images.append(image.convert("RGB") if hasattr(image, "convert") else image)
+    return images
+
+
 class RLHFDataset(Dataset):
     """
     Load and preprocess RLHF data from Parquet files.
@@ -439,7 +464,12 @@ class RLHFDataset(Dataset):
             images: List of images.
             videos: List of videos, each video is a tuple of (video_tensor, video_metadata).
         """
-        from qwen_vl_utils import process_vision_info
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError:
+            # Without qwen_vl_utils the images in the messages are taken as they are
+            # (PIL, a path, or bytes); the model's own processor resizes them.
+            return _images_from_messages(messages), []
 
         # When called from an AgentLoop, many trajectory coroutines share one
         # event loop. ``process_vision_info`` does synchronous PNG decode +
@@ -488,11 +518,18 @@ class RLHFDataset(Dataset):
             for message in messages
         )
         if has_visual:
-            from qwen_vl_utils import process_vision_info
-
-            images, videos = process_vision_info(
-                messages, image_patch_size=image_patch_size, return_video_metadata=True
-            )
+            try:
+                from qwen_vl_utils import process_vision_info
+            except ImportError:
+                # Without qwen_vl_utils the images in the messages are taken as they are
+                # (PIL, a path, or bytes); the model's own processor resizes them.
+                process_vision_info = None
+            if process_vision_info is None:
+                images, videos = _images_from_messages(messages) or None, None
+            else:
+                images, videos = process_vision_info(
+                    messages, image_patch_size=image_patch_size, return_video_metadata=True
+                )
         else:
             images, videos = None, None
         audios = cls._extract_audio_info(messages)

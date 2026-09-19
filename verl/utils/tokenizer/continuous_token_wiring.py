@@ -136,6 +136,9 @@ _MODEL_TYPE_TO_FAMILY: dict[str, ContinuousTokenModelFamily] = {
     "qwen3_vl_moe": ContinuousTokenModelFamily.QWEN3_VL,
     "minimax_vl_01": ContinuousTokenModelFamily.MINIMAX_VL,
     "kimi_vl": ContinuousTokenModelFamily.KIMI_VL,
+    # Kimi K3's processor takes text plus medias, which is the generic VL render;
+    # the Kimi-VL builder's conversations call does not exist on it.
+    "kimi_k3": ContinuousTokenModelFamily.VL_DEFAULT,
     "glm4v": ContinuousTokenModelFamily.GLM4V,
     "glm4v_moe": ContinuousTokenModelFamily.GLM4V,
     "deepseek_vl_v2": ContinuousTokenModelFamily.DEEPSEEK_VL2,

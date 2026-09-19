@@ -127,11 +127,112 @@ def build_multimodal_processor_inputs(
         processor_kwargs.setdefault("video_metadata", video_metadata)
         processor_kwargs.setdefault("do_sample_frames", False)
 
+    if images and processor_takes_medias(processor):
+        return _call_medias_processor(processor, text, images, processor_kwargs)
+
     processor_inputs = {"text": text, "images": images, "videos": videos, **processor_kwargs}
     if audio is not None:
         processor_inputs["audio"] = audio
 
     return processor(**processor_inputs)
+
+
+def processor_takes_medias(processor) -> bool:
+    """Kimi K3's processor takes its images as ``medias`` and ignores ``images``."""
+    import inspect
+
+    try:
+        return "medias" in inspect.signature(processor.__call__).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _call_medias_processor(processor, text, images, processor_kwargs):
+    """Call a ``medias`` processor and expand its image placeholder to one pad per patch.
+
+    The processor emits one ``<|media_pad|>`` per image; the model wants as many as the
+    image has merged patches, the count the processor's own calculator gives (the vLLM
+    side expands the same way), so the pads are repeated here in ``input_ids`` and
+    ``attention_mask``.
+    """
+    import torch
+
+    if isinstance(text, (list, tuple)):
+        if len(text) != 1:
+            raise ValueError("a medias processor takes one prompt per call")
+        text = text[0]
+    medias = [{"type": "image", "image": image} for image in images]
+    out = processor(text=text, medias=medias, **processor_kwargs)
+    pad_id = media_pad_token_id(processor)
+    counts = [int(processor.media_processor.media_tokens_calculator(media)) for media in medias]
+    ids = out["input_ids"]
+    was_tensor = torch.is_tensor(ids)
+    row = ids[0].tolist() if was_tensor else list(ids[0] if isinstance(ids[0], (list, tuple)) else ids)
+    positions = [i for i, tok in enumerate(row) if tok == pad_id]
+    if len(positions) != len(counts):
+        raise ValueError(f"{len(positions)} image placeholders in the prompt for {len(counts)} images")
+    expanded: list[int] = []
+    last = 0
+    for pos, count in zip(positions, counts):
+        expanded.extend(row[last:pos])
+        expanded.extend([pad_id] * count)
+        last = pos + 1
+    expanded.extend(row[last:])
+    if was_tensor:
+        out["input_ids"] = torch.tensor([expanded], dtype=ids.dtype)
+        out["attention_mask"] = torch.ones(1, len(expanded), dtype=out["attention_mask"].dtype)
+    else:
+        out["input_ids"] = [expanded]
+        out["attention_mask"] = [[1] * len(expanded)]
+    return out
+
+
+_MEDIA_PAD = "<|media_pad|>"
+
+
+def media_pad_token_id(processor) -> int | None:
+    """The pad a ``medias`` processor expands per image patch, None for other processors."""
+    if not processor_takes_medias(processor):
+        return None
+    return int(processor.tokenizer.convert_tokens_to_ids(_MEDIA_PAD))
+
+
+def media_features(processor, images) -> dict:
+    """The vision tensors of a ``medias`` processor for ``images`` alone, without a prompt."""
+    if not images:
+        return {}
+    medias = [{"type": "image", "image": image} for image in images]
+    return dict(processor.media_processor.preprocess(medias, return_tensors="pt").data)
+
+
+def collapse_media_blocks(prompt_ids: list[int], processor) -> list[int]:
+    """Fold each expanded media block back into the image placeholder the rollout engine expands.
+
+    The training stream spells an image as ``<|media_begin|>`` ... ``<|media_content|>``, the pads,
+    ``<|media_end|>``; vLLM's Kimi K3 processor writes that block itself from the placeholder, so the
+    rollout prompt carries the placeholder in its own token spelling.
+    """
+    if not processor_takes_medias(processor):
+        return prompt_ids
+    tokenizer = processor.tokenizer
+    begin = tokenizer.convert_tokens_to_ids("<|media_begin|>")
+    end = tokenizer.convert_tokens_to_ids("<|media_end|>")
+    placeholder = tokenizer.encode(processor.image_placeholder, add_special_tokens=False)
+    out: list[int] = []
+    i = 0
+    while i < len(prompt_ids):
+        if prompt_ids[i] != begin:
+            out.append(prompt_ids[i])
+            i += 1
+            continue
+        j = i + 1
+        while j < len(prompt_ids) and prompt_ids[j] != end:
+            j += 1
+        if j == len(prompt_ids):
+            raise ValueError("a media block opens without <|media_end|>")
+        out.extend(placeholder)
+        i = j + 1
+    return out
 
 
 def set_pad_token_id(tokenizer):
@@ -228,6 +329,12 @@ def hf_processor(name_or_path, **kwargs):
                 model_class = Glm46VModel
             case "MllamaProcessor":
                 pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+            case "KimiK3Processor":
+                # Kimi K3 is NoPE: MLA applies no positional encoding and KDA
+                # carries position in its recurrence, so there is no
+                # get_rope_index to bind. Without this case the processor is
+                # rejected outright and multimodal inputs silently degrade.
+                pass
             case "Gemma4Processor":
                 # Gemma4 uses standard 1D RoPE -> no get_rope_index to bind. Disable its strict
                 # per-image-token check (which Qwen's processor lacks).

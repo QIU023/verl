@@ -46,7 +46,9 @@ class NoOpDataLoader(BaseDataLoader):
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
-        pass
+        # Model configs may read the dataloader's dataset (Kimi K3 refuses sample
+        # packing by inspecting it); verl feeds the data itself, so there is none.
+        dataset: Any = None
 
     def __init__(self, **kwargs):
         pass
@@ -74,6 +76,14 @@ _HF_MODEL_TYPE_TO_TORCHTITAN_NAME = {
     "llama4": "llama4",
     "deepseek_v3": "deepseek_v3",
     "gpt_oss": "gpt_oss",
+    # Kimi-Linear / K3 family lives under torchtitan.experiments until
+    # core promotion; _import_torchtitan_model_module falls back there.
+    "kimi_linear": "kimi_k3",
+    # K3's released config.json declares model_type "kimi_k3" (the 48B
+    # predecessor used "kimi_linear"), and both resolve to the same torchtitan
+    # package -- the flavor is then picked by shape, so one package serves the
+    # 48B, the scaling-law sizes and the 2.8T alike.
+    "kimi_k3": "kimi_k3",
 }
 
 
@@ -141,9 +151,11 @@ def derive_torchtitan_name_and_flavor(hf_config) -> tuple[str, str]:
             f"Expected a dict attribute ending with '_configs'."
         )
 
-    hidden_size = hf_config.hidden_size
-    num_layers = hf_config.num_hidden_layers
-    vocab_size = hf_config.vocab_size
+    # Multimodal configs (e.g. kimi_k3) nest the decoder under text_config.
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    hidden_size = text_config.hidden_size
+    num_layers = text_config.num_hidden_layers
+    vocab_size = text_config.vocab_size
 
     for flavor_name in flavor_names:
         cfg = model_registry(flavor_name).model

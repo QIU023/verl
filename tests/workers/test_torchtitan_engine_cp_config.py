@@ -207,3 +207,29 @@ class TestFoldedTokenStreamProbe(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMultimodalKwargs(unittest.TestCase):
+    def test_processor_outputs_become_the_forward_kwargs(self):
+        import torch
+
+        from verl.workers.engine.torchtitan.transformer_impl import _model_multimodal_kwargs, _squeeze_folded
+
+        params = frozenset({"tokens", "pixel_values", "grid_thw", "special_tokens", "positions"})
+        out = _model_multimodal_kwargs(
+            {"pixel_values": torch.zeros(4, 3, 2, 2), "grid_thws": torch.tensor([[1, 2, 2]]), "attention_mask": torch.ones(3)},
+            params,
+            163605,
+        )
+        self.assertEqual(set(out), {"pixel_values", "grid_thw", "special_tokens"})
+        self.assertEqual(tuple(out["pixel_values"].shape), (4, 12))
+        self.assertEqual(out["special_tokens"], {"image_id": 163605})
+        # a single-image micro-batch keeps grid_thw as [1, 3]; the stream folds
+        folded = _squeeze_folded({"positions": torch.zeros(1, 7), **out})
+        self.assertEqual(tuple(folded["positions"].shape), (7,))
+        self.assertEqual(tuple(folded["grid_thw"].shape), (1, 3))
+
+    def test_no_images_no_placeholder(self):
+        from verl.workers.engine.torchtitan.transformer_impl import _model_multimodal_kwargs
+
+        self.assertEqual(_model_multimodal_kwargs({}, frozenset({"special_tokens"}), 163605), {})
