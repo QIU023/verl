@@ -87,9 +87,17 @@ def _parallelism_compat_kwargs(spmd_backend: str, cp_enabled: bool) -> dict:
     if "spmd_backend" in fields:
         kwargs["spmd_backend"] = spmd_backend
     if cp_enabled:
-        from torchtitan.config import ContextParallelLoadBalancerConfig
-
-        kwargs["context_parallel_load_balancer"] = ContextParallelLoadBalancerConfig(load_balancer_type=None)
+        # torchtitan models this field two ways: a ContextParallelLoadBalancerConfig on
+        # trees that define it, and a plain str | None elsewhere. Pin the balancer off in
+        # whichever shape the tree exposes.
+        try:
+            from torchtitan.config import ContextParallelLoadBalancerConfig
+        except ImportError:
+            kwargs["context_parallel_load_balancer"] = None
+        else:
+            kwargs["context_parallel_load_balancer"] = ContextParallelLoadBalancerConfig(
+                load_balancer_type=None
+            )
     return kwargs
 
 
