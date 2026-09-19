@@ -123,6 +123,58 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+class _PipelineLossBridge:
+    """The loss the pipeline schedule calls on the last stage.
+
+    torchtitan builds its schedule with a loss at construction; verl hands a
+    loss function to every forward_backward_batch call. The bridge is
+    installed as the schedule's loss once and re-targeted per call: the
+    target the schedule passes is the micro-batch index, and the bridge runs
+    verl's output preparation and loss on that micro-batch, keeping the
+    outputs the worker collects from the last stage.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.reset(None)
+
+    def reset(self, loss_function):
+        self.loss_function = loss_function
+        self.micro_batches = {}
+        self.output_args = {}
+        self.outputs = {}
+        self.padding = set()
+
+    def __call__(self, pred, target, **_):
+        index = int(target.item()) if torch.is_tensor(target) else int(target)
+        engine = self.engine
+        if pred.dim() == 2:
+            # The folded stream comes back as [T, V]; the CP gather in
+            # _finish_pred works on the token axis of [1, T, V].
+            pred = pred.unsqueeze(0)
+        pred = engine._finish_pred(pred)
+        pp_pad_len = self.output_args[index].get("pp_pad_len", 0)
+        if pp_pad_len:
+            pred = pred[:, :-pp_pad_len]
+        micro_batch = self.micro_batches[index]
+        model_output = engine.prepare_model_outputs(
+            logits=pred, output_args=self.output_args[index], micro_batch=micro_batch
+        )
+        if self.loss_function is not None:
+            loss, metrics = self.loss_function(
+                model_output=model_output, data=micro_batch, dp_group=engine.get_data_parallel_group()
+            )
+        else:
+            loss = pred.new_zeros((), dtype=torch.float32)
+            metrics = {}
+        if index in self.padding:
+            # A padding slot repeats a real micro-batch to fill the schedule's
+            # chunk; it contributes no gradient and no output.
+            return loss * 0.0
+        self.outputs[index] = {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
+        return loss
+
+
 class TorchTitanEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch TorchTitan parallelism.
@@ -226,6 +278,9 @@ class TorchTitanEngine(BaseEngine):
             enable_sequence_parallel=self.engine_config.sequence_parallel,
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             context_parallel_degree=self.engine_config.context_parallel_size,
+            # The engine feeds the schedule in chunks of this many verl micro-batches
+            # (torch requires at least one per stage), padding a short tail chunk.
+            num_pp_microbatches=max(1, self.engine_config.pipeline_parallel_size),
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             **_parallelism_compat_kwargs(
                 self.engine_config.spmd_backend, self.engine_config.context_parallel_size > 1
@@ -358,6 +413,11 @@ class TorchTitanEngine(BaseEngine):
         Sets up checkpoint manager.
         """
         self.module = self.trainer.model_parts
+        if self.parallel_dims.pp_enabled:
+            # torchtitan's schedule owns the loss; hand it the bridge so verl's
+            # per-call loss function reaches the last stage.
+            self._pp_bridge = _PipelineLossBridge(self)
+            self.trainer.pp_schedule._loss_fn = self._pp_bridge
         self.checkpointer = self.trainer.checkpointer
         # load initial HF weights
         self.checkpointer.load()
@@ -462,6 +522,11 @@ class TorchTitanEngine(BaseEngine):
             same_micro_num_in_dp=True,
         )
 
+        if self.parallel_dims.pp_enabled:
+            output_lst = self._pp_forward_backward_batch(
+                micro_batches, loss_function=loss_function, forward_only=forward_only
+            )
+            return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -479,6 +544,69 @@ class TorchTitanEngine(BaseEngine):
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
+    def _pp_forward_backward_batch(self, micro_batches, *, loss_function, forward_only):
+        """Drive the pipeline schedule over verl's micro-batches.
+
+        torch requires at least one pipeline microbatch per stage, so the
+        schedule is built with ``num_pp_microbatches = pipeline_parallel_size``
+        and the verl micro-batches are fed in chunks of that size; a short
+        tail chunk is padded by repeating its last micro-batch, and the bridge
+        zeroes the padding's loss so it adds no gradient and no output. The
+        last stage's outputs come back through the bridge, in order; the other
+        stages return placeholders the worker never collects.
+        """
+        trainer = self.trainer
+        schedule = trainer.pp_schedule
+        chunk = schedule._n_microbatches
+        bridge = self._pp_bridge
+        _guard_fsdp_grad_upcast()
+        bridge.reset(loss_function)
+        device_name = get_device_name()
+        first, last = trainer.pp_has_first_stage, trainer.pp_has_last_stage
+        folded = getattr(self.module[0], "folded_token_stream", False) or self._folded_token_stream
+        prepared = []
+        for index, micro_batch in enumerate(micro_batches):
+            micro_batch = micro_batch.to(get_device_id())
+            input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+            if folded and input_ids.dim() == 2 and input_ids.shape[0] == 1:
+                input_ids = input_ids.squeeze(0)
+                extra_inputs = _squeeze_folded(extra_inputs)
+            bridge.micro_batches[index] = micro_batch
+            bridge.output_args[index] = output_args
+            prepared.append((index, input_ids, {**extra_inputs, **extra_kwargs}))
+        for start in range(0, len(prepared), chunk):
+            group = prepared[start : start + chunk]
+            slots = list(group)
+            while len(slots) < chunk:
+                # Pad with a copy of the last real micro-batch under a fresh index.
+                pad_index = len(prepared) + len(bridge.padding)
+                real_index, input_ids, kwargs = group[-1]
+                bridge.micro_batches[pad_index] = bridge.micro_batches[real_index]
+                bridge.output_args[pad_index] = bridge.output_args[real_index]
+                bridge.padding.add(pad_index)
+                slots.append((pad_index, input_ids, kwargs))
+            arg_mbs = [(input_ids,) for _, input_ids, _ in slots]
+            kwarg_mbs = [kwargs for _, _, kwargs in slots]
+            target_mbs = [torch.tensor(index, device=get_device_id()) for index, _, _ in slots]
+            losses = [] if last else None
+            with trainer.train_context(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+                if forward_only:
+                    schedule.eval(
+                        arg_mbs=arg_mbs if first else None,
+                        kwarg_mbs=kwarg_mbs,
+                        target_mbs=target_mbs if last else None,
+                        losses=losses,
+                    )
+                else:
+                    schedule.step(
+                        arg_mbs=arg_mbs if first else None,
+                        kwarg_mbs=kwarg_mbs,
+                        target_mbs=target_mbs if last else None,
+                        losses=losses,
+                        return_outputs=False,
+                    )
+        return [bridge.outputs.get(index, {"loss": 0.0, "metrics": {}}) for index in range(len(micro_batches))]
+
     def model_forward_step(
         self,
         *,
@@ -493,9 +621,9 @@ class TorchTitanEngine(BaseEngine):
         parallel_dims = self.parallel_dims
 
         if parallel_dims.pp_enabled:
-            raise NotImplementedError(
-                "Pipeline parallelism is not yet supported in model_forward_step. "
-                "This will be implemented in a follow-up PR."
+            raise RuntimeError(
+                "model_forward_step is the non-pipeline path; under pipeline parallelism the "
+                "worker drives the schedule through _pp_forward_backward_batch"
             )
         else:
             # Non-PP forward. train_context (SPMD mesh) is set by the caller.
@@ -783,7 +911,74 @@ class TorchTitanEngine(BaseEngine):
                 del full
 
         # TODO: support Torchtitan PEFT
-        return _gen(), None
+        gen = _gen()
+        if self.parallel_dims.pp_enabled:
+            gen = self._iter_pp_gathered(gen, device)
+        return gen, None
+
+    def _iter_pp_gathered(self, gen, device):
+        """Stream the stages in order: the owning rank yields its own tensors and broadcasts them, the
+        other pipeline ranks receive and yield the same sequence; one tensor in flight at a time."""
+        pp_mesh = self.parallel_dims.get_mesh("pp")
+        group = pp_mesh.get_group()
+        ranks = torch.distributed.get_process_group_ranks(group)
+        mine = pp_mesh.get_local_rank()
+        for stage in range(pp_mesh.size()):
+            src = ranks[stage]
+            if stage == mine:
+                for name, tensor in gen:
+                    t = tensor.to(device).contiguous()
+                    torch.distributed.broadcast_object_list([(name, tuple(t.shape), t.dtype)], src=src, group=group)
+                    torch.distributed.broadcast(t, src=src, group=group)
+                    yield name, t
+                torch.distributed.broadcast_object_list([None], src=src, group=group)
+            else:
+                while True:
+                    box = [None]
+                    torch.distributed.broadcast_object_list(box, src=src, group=group)
+                    if box[0] is None:
+                        break
+                    name, shape, dtype = box[0]
+                    t = torch.empty(shape, dtype=dtype, device=device)
+                    torch.distributed.broadcast(t, src=src, group=group)
+                    yield name, t
+
+
+_FSDP_GRAD_UPCAST_GUARDED = False
+
+
+def _guard_fsdp_grad_upcast() -> None:
+    """Skip FSDP2's gradient upcast for a parameter that was never all-gathered.
+
+    Under a pipeline schedule the non-last micro-batches run FSDP2's post_backward with
+    grad reduction off; that path upcasts each parameter's unsharded gradient and reads
+    ``_unsharded_param`` without the ``hasattr`` guard its reduce path has, so a
+    parameter group whose forward never ran on this rank (a module the batch does not
+    reach) raises AttributeError. Mirror the guard, and name the parameter once.
+    """
+    global _FSDP_GRAD_UPCAST_GUARDED
+    if _FSDP_GRAD_UPCAST_GUARDED:
+        return
+    _FSDP_GRAD_UPCAST_GUARDED = True
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+
+    original = FSDPParam.to_accumulated_grad_if_needed
+    reported: set[str] = set()
+
+    def guarded(self):
+        if not hasattr(self, "_unsharded_param"):
+            fqn = getattr(self, "_param_fqn", None) or getattr(self, "fqn", "?")
+            if fqn not in reported:
+                reported.add(fqn)
+                logger.warning(
+                    "FSDP2 post_backward for %s without an all-gather on this rank: "
+                    "skipping its gradient upcast",
+                    fqn,
+                )
+            return
+        return original(self)
+
+    FSDPParam.to_accumulated_grad_if_needed = guarded
 
 
 # Multimodal tensors keep their own leading dimension (images, not the folded stream).
@@ -807,6 +1002,28 @@ def checkpoint_step_from_path(local_path: str) -> int:
     """
     match = re.search(r"global_step_(\d+)", local_path)
     return int(match.group(1)) if match else -1
+
+
+def pipeline_token_budget(configured: int | None, tokens: int) -> int:
+    """The fixed per-micro-batch token count pipeline parallelism pads to.
+
+    The config field wins; ``VERL_PP_TOKEN_BUDGET`` is the fallback, so a run can set it
+    without a config edit. Both refusals name the knob, since a stage sizes its P2P
+    buffers from the first micro-batch and a later one of another length deadlocks.
+    """
+    budget = int(configured or os.environ.get("VERL_PP_TOKEN_BUDGET", "0"))
+    if budget <= 0:
+        raise ValueError(
+            "pipeline parallelism needs a fixed token count per micro-batch; set "
+            "torchtitan.pipeline_token_budget (or VERL_PP_TOKEN_BUDGET) to at least "
+            "the largest packed micro-batch"
+        )
+    if tokens > budget:
+        raise ValueError(
+            f"micro-batch of {tokens} tokens exceeds the pipeline token budget {budget}; "
+            "raise the budget or lower the micro-batch size"
+        )
+    return budget
 
 
 def _squeeze_folded(extra: dict) -> dict:
@@ -942,6 +1159,29 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # extra_kwargs are.
         extra_kwargs: dict[str, Any] = {"attention_masks": attention_mask}
         cp_pad_len = 0
+        if self.parallel_dims.pp_enabled:
+            # Pipeline stages size their P2P buffers once, from the first
+            # microbatch, so every microbatch must carry the same token
+            # count. Pad the packed stream to a fixed budget before any CP
+            # split: positions continue the stream, the mask is rebuilt, and
+            # the bridge cuts the logits back before the loss.
+            tokens = input_ids.shape[-1]
+            budget = pipeline_token_budget(self.engine_config.pipeline_token_budget, tokens)
+            pp_pad_len = budget - tokens
+            if pp_pad_len:
+                pad_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+                input_ids = torch.nn.functional.pad(input_ids, (0, pp_pad_len), value=pad_id)
+                continued = torch.arange(1, pp_pad_len + 1, device=position_ids.device)
+                position_ids = torch.cat((position_ids, position_ids[..., -1:] + continued), dim=-1)
+                extra_inputs["positions"] = position_ids
+                if attention_mask is not None:
+                    attention_mask = get_attention_masks(
+                        input_batch=input_ids,
+                        positions=position_ids,
+                        attn_type=self.engine_config.attn_type,
+                    )
+                    extra_kwargs["attention_masks"] = attention_mask
+            output_args["pp_pad_len"] = pp_pad_len
         pad_multiple = 1
         if self.parallel_dims.cp_enabled:
             input_ids, labels, extra_kwargs = prepare_context_parallel_input(
