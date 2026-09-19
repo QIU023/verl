@@ -36,8 +36,7 @@ from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfi
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-from torchtitan.config.transform import apply_transforms
+from torchtitan.config.transform import apply_transforms, ContextParallelTransform
 
 
 def _parallelism_compat_kwargs(spmd_backend: str, cp_enabled: bool) -> dict:
@@ -87,6 +86,30 @@ def _lora_transform(model_config):
         alpha=float(lora_cfg.get("alpha", 2 * rank)),
         target_modules=list(targets) if targets else None,
     )
+
+
+def _context_parallel_transform(model_config, backend: str) -> ContextParallelTransform:
+    """The CP backends for the inner attentions this model config carries.
+
+    Flex attention takes the Ulysses backend by default: it keeps the attention masks
+    global, whereas the all-gather-KV backend shards the flex BlockMask through torch's
+    compiled ``create_block_mask``, which the colocated worker process cannot compile.
+    Subtrees whose tokens are not sharded on the cp axis (a vision tower) keep their
+    local attention.
+    """
+    from torchtitan.models.common.attention import FlexInnerAttention
+    from torchtitan.models.common.cp_attention import (
+        KVAllGatherCPFlexInnerAttention,
+        UlyssesCPFlexInnerAttention,
+    )
+
+    flex_backends = {"ulysses": UlyssesCPFlexInnerAttention, "allgather_kv": KVAllGatherCPFlexInnerAttention}
+    if backend not in flex_backends:
+        raise ValueError(f"context_parallel_backend must be one of {sorted(flex_backends)}, got {backend!r}")
+    if not any(True for _ in model_config.traverse(FlexInnerAttention.Config)):
+        raise ValueError("context parallel needs attn_type 'flex': the CP backends are flex based")
+    mapping: dict = {FlexInnerAttention.Config: flex_backends[backend]}
+    return ContextParallelTransform(inner_attention=mapping, exclude_fqn_prefixes=("vision_encoder",))
 
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad
 from torchtitan.distributed.parallel_dims import ParallelDims
@@ -303,10 +326,12 @@ class TorchTitanEngine(BaseEngine):
             tensor_parallel_degree=self.engine_config.tensor_parallel_size,
             enable_sequence_parallel=self.engine_config.sequence_parallel,
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
-            context_parallel_degree=self.engine_config.context_parallel_size,
             # The engine feeds the schedule in chunks of this many verl micro-batches
             # (torch requires at least one per stage), padding a short tail chunk.
             num_pp_microbatches=max(1, self.engine_config.pipeline_parallel_size),
+            # The degree is set once the CP transform has replaced the inner attentions:
+            # Trainer.Config validates the pairing at construction (see below).
+            context_parallel_degree=1,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
             **_parallelism_compat_kwargs(
                 self.engine_config.spmd_backend, self.engine_config.context_parallel_size > 1
@@ -367,6 +392,15 @@ class TorchTitanEngine(BaseEngine):
             loss=CrossEntropyLoss.Config(),
         )
         transforms = []
+        if self.engine_config.context_parallel_size > 1:
+            # As torchtitan's own CP recipes do: raise the degree on the built config, then
+            # apply the transform, whose validated copy pairs the degree with the backends.
+            self.config.parallelism.context_parallel_degree = self.engine_config.context_parallel_size
+            transforms.append(
+                _context_parallel_transform(
+                    self.config.model_spec.model, self.engine_config.context_parallel_backend
+                )
+            )
         lora_transform = _lora_transform(self.model_config)
         if lora_transform is not None:
             # model.lora with a rank adapts through torchtitan's own transform (ordered after
@@ -702,6 +736,13 @@ class TorchTitanEngine(BaseEngine):
                 raise ValueError(f"logits vocab dim {pred.shape[-1]} is neither the vocabulary ({vocab}) nor its tp shard")
             elif getattr(self.module[-1], "_sp_group", None) is not None:
                 pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, grad_scaler=False, group=tp_group)
+        if parallel_dims.cp_enabled:
+            # Inputs were seq-sharded across cp; the loss side works on full sequences
+            # (see prepare_model_inputs), so gather the logits back. Every cp rank
+            # computes the same full loss and FSDP reduces over dp_shard x cp, so the
+            # backward takes this rank's slice unscaled, as for tp above.
+            cp_group = parallel_dims.get_mesh("cp").get_group()
+            pred = gather_outputs_and_unpad(pred.contiguous(), gather_dim=1, grad_scaler=False, group=cp_group)
         return pred
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -1586,14 +1627,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             output_args["pp_pad_len"] = pp_pad_len
         pad_multiple = 1
         if self.parallel_dims.cp_enabled:
-            input_ids, labels, extra_kwargs = prepare_context_parallel_input(
-                input_ids,
-                labels,
-                extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
-                self.trainer.device,
-                self.trainer.config.parallelism.context_parallel_load_balancer,
-            )
+            # Context parallel cuts the packed stream into contiguous rank-ordered shards
+            # (_parallelism_compat_kwargs) and the flex BlockMask wants whole 128-token
+            # blocks per shard; a packed no-padding stream is neither. ulysses_pad does
+            # the padding, with the adjustments below.
+            pad_multiple = self.parallel_dims.cp * 128
         if self.parallel_dims.tp_enabled:
             # Sequence parallel scatters the token dim across the TP ranks, so the
             # packed stream must divide by the TP degree as well.
@@ -1630,7 +1668,29 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                         attn_type=self.engine_config.attn_type,
                     )
                     extra_kwargs["attention_masks"] = attention_mask
-        if self._folded_token_stream:
+        if self.parallel_dims.cp_enabled:
+            # The model owns its context-parallel preprocessing on this tree: the masks
+            # from the positions, the shards and the layouts. Hand it
+            # the folded [T] stream with the global positions and take back this
+            # rank's inputs and kwargs. Labels stay FULL length: verl's loss path
+            # (nested no-padding log_prob / loss_mask handling) assumes full
+            # sequences, so the engine all-gathers the seq-sharded logits after the
+            # model call (_finish_pred) instead of sharding the loss side.
+            if position_ids.dim() != 2 or position_ids.shape[0] != 1:
+                raise NotImplementedError("context parallel takes a [1, T] position stream")
+            batch = {
+                "input": input_ids.squeeze(0),
+                "labels": labels.squeeze(0),
+                "positions": position_ids.squeeze(0),
+            }
+            local_inputs, _labels_local, extra_kwargs = self.module[0].preprocess_inputs(
+                batch,
+                parallel_dims=self.parallel_dims,
+                parallelism=self.config.parallelism,
+            )
+            input_ids = local_inputs.unsqueeze(0)
+            extra_inputs = {}
+        elif self._folded_token_stream:
             # A model whose forward takes the packed stream's document offsets (a
             # linear-attention recurrence, which would otherwise run across the
             # documents of a micro-batch) gets them explicitly; a document starts where

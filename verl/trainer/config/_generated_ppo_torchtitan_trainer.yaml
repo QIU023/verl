@@ -41,6 +41,7 @@ actor_rollout_ref:
       expert_parallel_size: 1
       pipeline_parallel_size: 1
       context_parallel_size: 1
+      context_parallel_backend: ulysses
       sequence_parallel: true
       initial_load_path: null
       pipeline_token_budget: null
@@ -190,6 +191,7 @@ actor_rollout_ref:
       expert_parallel_size: ${oc.select:actor_rollout_ref.actor.torchtitan.expert_parallel_size,1}
       pipeline_parallel_size: ${oc.select:actor_rollout_ref.actor.torchtitan.pipeline_parallel_size,1}
       context_parallel_size: ${oc.select:actor_rollout_ref.actor.torchtitan.context_parallel_size,1}
+      context_parallel_backend: ${oc.select:actor_rollout_ref.actor.torchtitan.context_parallel_backend,ulysses}
       sequence_parallel: ${oc.select:actor_rollout_ref.actor.torchtitan.sequence_parallel,true}
       initial_load_path: ${oc.select:actor_rollout_ref.actor.torchtitan.initial_load_path,null}
       pipeline_token_budget: ${oc.select:actor_rollout_ref.actor.torchtitan.pipeline_token_budget,null}
@@ -533,6 +535,7 @@ critic:
     expert_parallel_size: 1
     pipeline_parallel_size: 1
     context_parallel_size: 1
+    context_parallel_backend: ulysses
     sequence_parallel: true
     initial_load_path: null
     pipeline_token_budget: null

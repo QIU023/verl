@@ -502,6 +502,8 @@ class TorchtitanEngineConfig(EngineConfig):
         expert_tensor_parallel_size (int): Expert tensor parallel size, default 1
         pipeline_parallel_size (int): Pipeline parallel size, default 1
         context_parallel_size (int): Context parallel size, default 1
+        context_parallel_backend (str): the CP backend for flex attention, "ulysses" (default; masks
+            stay global) or "allgather_kv" (the flex BlockMask is sharded per rank)
         sequence_parallel (bool): sequence parallel on the tensor-parallel axis, default True
         pipeline_token_budget (int | None): under pipeline parallelism every micro-batch is padded to this
             many tokens so the stages size their buffers once; at least the largest packed micro-batch
@@ -543,6 +545,7 @@ class TorchtitanEngineConfig(EngineConfig):
     expert_tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     context_parallel_size: int = 1
+    context_parallel_backend: str = "ulysses"
     sequence_parallel: bool = True
     initial_load_path: Optional[str] = None
     pipeline_token_budget: Optional[int] = None
@@ -558,6 +561,9 @@ class TorchtitanEngineConfig(EngineConfig):
         super().__post_init__()
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
+        )
+        assert self.context_parallel_backend in ["ulysses", "allgather_kv"], (
+            f"context_parallel_backend must be 'ulysses' or 'allgather_kv', got {self.context_parallel_backend!r}"
         )
         assert self.spmd_backend in ["default", "full_dtensor", "spmd_types"], (
             f"spmd_backend {self.spmd_backend} not supported"

@@ -38,6 +38,20 @@ class TestInitialCheckpointSource(unittest.TestCase):
         self.assertIs(load_in_hf, False)
 
 
+class TestContextParallelBackendIsCheckedByTheConfig(unittest.TestCase):
+    """The engine's transform refuses an unknown backend too; this is the earlier gate."""
+
+    def test_the_two_backends_are_accepted(self):
+        for backend in ("ulysses", "allgather_kv"):
+            self.assertEqual(
+                TorchtitanEngineConfig(context_parallel_backend=backend).context_parallel_backend,
+                backend,
+            )
+
+    def test_an_unknown_backend_is_refused_with_its_name(self):
+        with self.assertRaises(AssertionError) as caught:
+            TorchtitanEngineConfig(context_parallel_backend="ring")
+        self.assertIn("ring", str(caught.exception))
 
 
 if __name__ == "__main__":
