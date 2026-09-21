@@ -38,6 +38,23 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("torchtitan.models.kimi_k3")
 
 
+def _tree_lora_available() -> bool:
+    """The merged sync folds adapters through torchtitan's merge helper on the LoRA debug
+    recipe; both live on the torchtitan tree the engine targets, not on upstream main yet."""
+    try:
+        from torchtitan.config.transform.lora import merge_lora_state_dict  # noqa: F401
+        from torchtitan.models.kimi_k3 import config_registry
+    except ImportError:
+        return False
+    return hasattr(config_registry, "kimi_k3_debugmodel_lora")
+
+
+_needs_tree_lora = pytest.mark.skipif(
+    not _tree_lora_available(),
+    reason="torchtitan tree without merge_lora_state_dict and the kimi_k3 LoRA debug recipe",
+)
+
+
 def _helper():
     """Load just the transform, without pulling in the engine's dependency chain."""
     import pathlib
@@ -66,6 +83,7 @@ def _lora_model():
 
 
 class TestMergedWeightSync:
+    @_needs_tree_lora
     def test_adapter_tensors_do_not_reach_the_rollout(self):
         merged, merged_keys = _helper()(_lora_model())
         assert not [k for k in merged if "lora" in k or ".base." in k]
@@ -77,6 +95,7 @@ class TestMergedWeightSync:
             for k in merged
         ), sorted(merged)[:5]
 
+    @_needs_tree_lora
     def test_the_merged_output_tracks_the_adapter(self):
         """The differential that separates this from the raw path.
 
