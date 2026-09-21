@@ -19,6 +19,7 @@ import importlib
 import itertools
 import contextlib
 import logging
+import dataclasses
 import inspect
 import math
 import sys
@@ -387,8 +388,7 @@ class TorchTitanEngine(BaseEngine):
         load_in_hf, load_path = initial_checkpoint_source(
             self.engine_config.initial_load_path, model_config.path
         )
-        checkpoint = CheckpointManager.Config(
-            enable=True,
+        checkpoint_kwargs = dict(
             initial_load_in_hf=load_in_hf,
             initial_load_model_only=True,
             initial_load_path=load_path,
@@ -398,7 +398,12 @@ class TorchTitanEngine(BaseEngine):
             # saves in runs shorter than 500 / not multiples of it).
             interval=1,
         )
-        compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
+        # torchtitan main made the checkpointer a component: present means
+        # enabled. Trees before that carry an enable flag.
+        if "enable" in _config_fields(CheckpointManager.Config):
+            checkpoint_kwargs["enable"] = True
+        checkpoint = CheckpointManager.Config(**checkpoint_kwargs)
+        compile_config = _compile_config(self.engine_config.use_torch_compile)
         training_kwargs = {}
         # The standard token dispatcher synchronizes with the CPU, which CUDA
         # graphs cannot capture; run eager under expert parallel.
@@ -428,8 +433,8 @@ class TorchTitanEngine(BaseEngine):
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             parallelism=parallelism,
-            checkpoint=checkpoint,
             compile=compile_config,
+            **{_checkpoint_field(Trainer.Config): checkpoint},
             training=training,
             activation_checkpoint=activation_checkpoint,
             # Use a no-op dataloader since verl has its own data loading
@@ -458,15 +463,19 @@ class TorchTitanEngine(BaseEngine):
             self.config = apply_transforms(self.config, transforms)
         with _fp32_matmul_emulation_optional():
             self.trainer = Trainer(self.config)
+        # torchtitan main keeps the model parts, optimizers, schedule and
+        # checkpointer on the trainer's TrainingEngine; earlier trees on the
+        # Trainer itself.
+        self._titan = getattr(self.trainer, "engine", self.trainer)
         # Decoders on torchtitan main take a folded [T] token stream and own their input
         # preprocessing (masks, CP shards, layouts); probed on the model, not on its name.
         from torchtitan.protocols.model import BaseModel
 
         self._folded_token_stream = (
-            type(self.trainer.model_parts[0]).preprocess_inputs is not BaseModel.preprocess_inputs
+            type(self._titan.model_parts[0]).preprocess_inputs is not BaseModel.preprocess_inputs
         )
         self._forward_params = frozenset(
-            inspect.signature(type(self.trainer.model_parts[0]).forward).parameters
+            inspect.signature(type(self._titan.model_parts[0]).forward).parameters
         )
         self._forward_takes_cu_seqlens = "cu_seqlens" in self._forward_params
 
@@ -477,7 +486,7 @@ class TorchTitanEngine(BaseEngine):
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
         if self.engine_config.data_parallel_shard_size > 1:
             dp_size = self.get_data_parallel_size()
-            for model_part in self.trainer.model_parts:
+            for model_part in self._titan.model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
         if self.engine_config.full_determinism:
@@ -532,19 +541,19 @@ class TorchTitanEngine(BaseEngine):
         Applies device, dtype, and precision configurations, including mixed precision.
         Sets up checkpoint manager.
         """
-        self.module = self.trainer.model_parts
+        self.module = self._titan.model_parts
         if self.parallel_dims.pp_enabled:
             # torchtitan's schedule owns the loss; hand it the bridge so verl's
             # per-call loss function reaches the last stage.
             self._pp_bridge = _PipelineLossBridge(self)
-            self.trainer.pp_schedule._loss_fn = self._pp_bridge
-        self.checkpointer = self.trainer.checkpointer
+            self._titan.pp_schedule._loss_fn = self._pp_bridge
+        self.checkpointer = self._titan.checkpointer
         # load initial HF weights
         self.checkpointer.load()
 
         if not self.engine_config.forward_only:
-            self.optimizer = self.trainer.optimizers
-            self.lr_scheduler = self.trainer.lr_schedulers
+            self.optimizer = self._titan.optimizers
+            self.lr_scheduler = self._titan.lr_schedulers
         else:
             self.optimizer = None
             self.lr_scheduler = None
@@ -562,7 +571,7 @@ class TorchTitanEngine(BaseEngine):
         """Initialize the device mesh for TorchTitan style parallelism."""
         # The trainer's ParallelDims and mesh: the model's SPMD context and the engine's
         # gathers must name the same process groups.
-        self.parallel_dims = self.trainer.parallel_dims
+        self.parallel_dims = self._titan.parallel_dims
         self.device_mesh = self.parallel_dims._world_mesh
 
         # Mirror torchtitan's init_distributed (which verl bypasses): disable autograd
@@ -656,7 +665,7 @@ class TorchTitanEngine(BaseEngine):
         # record_function names each micro-batch so a forward-only stage (compute_log_prob /
         # compute_ref_log_prob) shows "micro_batch<i>" rows instead of a single anonymous forward.
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+            with self._titan.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 if not forward_only:
                     loss.backward()
@@ -675,7 +684,7 @@ class TorchTitanEngine(BaseEngine):
         last stage's outputs come back through the bridge, in order; the other
         stages return placeholders the worker never collects.
         """
-        trainer = self.trainer
+        trainer = self._titan
         schedule = trainer.pp_schedule
         chunk = schedule._n_microbatches
         bridge = self._pp_bridge
@@ -1446,6 +1455,22 @@ def _dynamo_probe_once() -> None:
 _MULTIMODAL_KEY_ALIASES = {"grid_thws": "grid_thw", "image_grid_thw": "grid_thw"}
 # Multimodal tensors keep their own leading dimension (images, not the folded stream).
 _MULTIMODAL_KEYS = ("pixel_values", "grid_thw", "pixel_values_videos", "grid_thw_videos", "special_tokens")
+
+
+def _config_fields(config_cls) -> frozenset[str]:
+    return frozenset(f.name for f in dataclasses.fields(config_cls))
+
+
+def _checkpoint_field(trainer_config_cls) -> str:
+    """The trainer config's checkpoint field: ``checkpointer`` on torchtitan main."""
+    return "checkpointer" if "checkpointer" in _config_fields(trainer_config_cls) else "checkpoint"
+
+
+def _compile_config(enable: bool):
+    """torchtitan main made the compile config optional; earlier trees carry an enable flag."""
+    if "enable" in _config_fields(CompileConfig):
+        return CompileConfig(enable=enable)
+    return CompileConfig() if enable else None
 
 
 def initial_checkpoint_source(initial_load_path: str | None, model_path: str) -> tuple[bool, str]:
