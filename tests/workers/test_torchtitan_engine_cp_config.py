@@ -33,8 +33,15 @@ yaml = pytest.importorskip("yaml")
 # The engine module imports torchtitan at module scope, so skip rather than fail when
 # the fork is not on the path -- same guard as the sibling engine tests.
 pytest.importorskip("torchtitan.models.kimi_k3")
+# The transform under test maps inner attentions per type and pins a load-balancer
+# config: the context-parallel API of the torchtitan tree these tests target. A tree
+# without it (upstream main's single-class transform) skips the file rather than fail.
+try:
+    from torchtitan.config import ContextParallelLoadBalancerConfig
+    from torchtitan.models.kimi_k3.cp_kda import ContextParallelInnerKDA
+except ImportError as missing:  # pragma: no cover - depends on the torchtitan tree
+    pytest.skip(f"torchtitan tree without the context-parallel API: {missing}", allow_module_level=True)
 
-from torchtitan.config import ContextParallelLoadBalancerConfig  # noqa: E402
 from torchtitan.config.transform import apply_transforms  # noqa: E402
 from torchtitan.models.common.attention import FlexInnerAttention  # noqa: E402
 from torchtitan.models.common.cp_attention import (  # noqa: E402
@@ -42,7 +49,6 @@ from torchtitan.models.common.cp_attention import (  # noqa: E402
     UlyssesCPFlexInnerAttention,
 )
 from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel  # noqa: E402
-from torchtitan.models.kimi_k3.cp_kda import ContextParallelInnerKDA  # noqa: E402
 from torchtitan.models.kimi_k3.kda import InnerKDA  # noqa: E402
 from torchtitan.models.llama3.config_registry import llama3_debugmodel  # noqa: E402
 from torchtitan.protocols.model import BaseModel  # noqa: E402
