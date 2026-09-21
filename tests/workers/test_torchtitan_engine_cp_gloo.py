@@ -37,6 +37,7 @@ thing the test has to arrange is ``parallel_dims.device_type`` being "cpu" while
 the mesh is built.
 """
 
+import importlib.util
 import os
 import traceback
 import unittest
@@ -48,6 +49,9 @@ torch = pytest.importorskip("torch")
 # The CP model path lives in the torchtitan fork; skip rather than fail when it is
 # not on the path -- same guard as the sibling engine tests.
 pytest.importorskip("torchtitan.models.kimi_k3")
+# The preprocess_inputs half runs the model's context-parallel path, which the torchtitan
+# tree the engine targets carries as the K3 CP module; a tree without it skips that half.
+_HAS_K3_CP = importlib.util.find_spec("torchtitan.models.kimi_k3.cp_kda") is not None
 
 import torch.multiprocessing as mp  # noqa: E402
 
@@ -284,6 +288,7 @@ def _preprocess_worker(rank, world):
     }
 
 
+@unittest.skipUnless(_HAS_K3_CP, "torchtitan tree without the K3 context-parallel module")
 class TestContextParallelPreprocessInputs(unittest.TestCase):
     """The K3 model's CP preprocessing on CPU: contiguous shards, masks, KDA routing."""
 
