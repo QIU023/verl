@@ -125,6 +125,32 @@ def _lora_transform(model_config):
     )
 
 
+def _check_lora_targets_exist(model_config, transform) -> None:
+    """Refuse a LoRA configuration that would adapt nothing.
+
+    ``target_modules`` are torchtitan's projection names, and verl's defaults
+    are other frameworks' spellings. A list that matches nothing still freezes
+    every other config, so the model reaches the optimizer with no trainable
+    parameter and the first backward raises far from the cause.
+    """
+    targets = transform.target_modules
+    if not targets:
+        return
+    from torchtitan.models.common.linear import Linear
+
+    names = {
+        fqn.rsplit(".", 1)[-1]
+        for fqn, _config, _parent, _ in model_config.traverse(Linear.Config)
+    }
+    missing = [t for t in targets if t not in names]
+    if len(missing) == len(targets):
+        raise ValueError(
+            f"model.lora.target_modules {targets} matches no projection of "
+            f"this model, which carries {sorted(names)}. torchtitan's own "
+            "names are wanted here, not another framework's."
+        )
+
+
 def _context_parallel_transform(model_config, backend: str) -> ContextParallelTransform:
     """The CP backends for the inner attentions this model config carries.
 
@@ -455,6 +481,7 @@ class TorchTitanEngine(BaseEngine):
             )
         lora_transform = _lora_transform(self.model_config)
         if lora_transform is not None:
+            _check_lora_targets_exist(self.config.model_spec.model, lora_transform)
             # model.lora with a rank adapts through torchtitan's own transform (ordered after
             # the CP transform by apply_transforms); a flavor that already carries LoRA keeps
             # model.lora at rank 0.
