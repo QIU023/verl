@@ -1,0 +1,3 @@
+{"step":1,"data":{"perf/max_memory_allocated_gb":6.9046759605407715,"perf/max_memory_reserved_gb":14.58984375,"perf/cpu_memory_used_gb":16.485515594482422,"train/loss":12.07198715209961,"train/grad_norm":4.038679122924805,"train/lr":1.0000000000000001e-7,"train/mfu":0.0,"train/global_tokens":66066,"train/total_tokens(B)":0.000066066}}
+{"step":2,"data":{"perf/max_memory_allocated_gb":8.008267402648926,"perf/max_memory_reserved_gb":14.58984375,"perf/cpu_memory_used_gb":16.510570526123047,"train/loss":12.068463325500488,"train/grad_norm":4.125909805297852,"train/lr":1.5000000000000002e-7,"train/mfu":0.0,"train/global_tokens":62939,"train/total_tokens(B)":0.000129005}}
+{"step":2,"data":{"val/loss":12.07231330871582}}
